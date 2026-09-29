@@ -27,6 +27,7 @@ How it works:
 
 import json
 import os
+import secrets
 import shutil
 import signal
 import socket
@@ -69,6 +70,11 @@ CCPROXY = _find_ccproxy()
 PY_EXE = Path(sys.executable) if sys.executable else None
 GATEWAY_LOG = HOME / ".claude-code-proxy.log"
 GATEWAY_PIDFILE = HOME / ".claude-code-proxy.pid"
+CCPROXY_CONFIG = HOME / ".claude-code-proxy.json"
+
+# Gateway client tokens that are considered "not set" and must be replaced by a
+# generated secret, so no local process can use the gateway unauthenticated.
+PLACEHOLDER_TOKENS = {"", "router-local", "local", "changeme", "your-token"}
 
 GW_HOST = "127.0.0.1"
 GW_PORT = 3457
@@ -210,11 +216,58 @@ def stop_gateway():
     return not port_open()
 
 
+def _read_gateway_config():
+    try:
+        return read_json(CCPROXY_CONFIG)
+    except Exception:
+        return {}
+
+
+def shared_token():
+    """The gateway's client token, or "" if none has been minted yet."""
+    return str(_read_gateway_config().get("client_token") or "").strip()
+
+
+def ensure_shared_token():
+    """Give the gateway a real secret and make Claude Code send the same one.
+
+    The gateway refuses requests that do not carry this token, so another local
+    process cannot quietly spend the upstream credential. Returns the token.
+    """
+    cfg = _read_gateway_config()
+    token = str(cfg.get("client_token") or "").strip()
+    if token in PLACEHOLDER_TOKENS:
+        token = secrets.token_urlsafe(24)
+        cfg["client_token"] = token
+        write_json(CCPROXY_CONFIG, cfg)
+        out("Gateway   : minted a client token -> %s" % CCPROXY_CONFIG)
+
+    # Claude Code sends x-api-key: keep it identical to the gateway's token.
+    for path in _gateway_settings_paths():
+        try:
+            data = read_json(path)
+        except Exception:
+            continue
+        if path != SETTINGS and not needs_gateway(data):
+            continue
+        env = data.setdefault("env", {})
+        if str(env.get("ANTHROPIC_AUTH_TOKEN") or "").strip() in PLACEHOLDER_TOKENS:
+            env["ANTHROPIC_AUTH_TOKEN"] = token
+            write_json(path, data)
+    return token
+
+
+def _gateway_settings_paths():
+    """settings.json plus every profile that points at the local gateway."""
+    return [SETTINGS] + [profile_path(n) for n in list_profiles()]
+
+
 def start_gateway():
     if PY_EXE is None or not PY_EXE.exists():
         die("cannot locate a python interpreter (sys.executable is empty)")
     if not CCPROXY.exists():
         die("ccproxy.py not found: " + str(CCPROXY))
+    ensure_shared_token()
     GATEWAY_LOG.parent.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
@@ -249,16 +302,35 @@ def direct_opener():
 
 
 def wait_health(timeout=25.0):
-    """Poll the gateway until it answers, return (ok, detail)."""
+    """Poll the gateway until it answers, return (ok, detail).
+
+    The reply must identify itself as ccproxy (and accept our token), so a
+    different program that happens to hold the port is reported rather than
+    trusted -- otherwise it could collect prompts meant for the real gateway.
+    """
     op = direct_opener()
+    token = shared_token()
+    req = urllib.request.Request("http://%s:%d/health" % (GW_HOST, GW_PORT))
+    if token:
+        req.add_header("x-api-key", token)
     deadline = time.time() + timeout
     last = ""
     while time.time() < deadline:
         try:
-            with op.open("http://%s:%d/" % (GW_HOST, GW_PORT), timeout=3) as r:
+            with op.open(req, timeout=3) as r:
+                body = r.read().decode("utf-8", "replace")
+                try:
+                    info = json.loads(body)
+                except Exception:
+                    info = {}
+                if info.get("service") != "ccproxy":
+                    return False, "port %d is held by another process" % GW_PORT
                 return True, "HTTP %d" % r.status
         except urllib.error.HTTPError as e:
-            return True, "HTTP %d" % e.code
+            if e.code == 401:
+                return False, ("gateway rejected our token - restart it with "
+                               "`ccswitch gateway` to re-sync")
+            return False, "HTTP %d" % e.code
         except Exception as e:
             last = str(e)
         time.sleep(0.4)
@@ -284,13 +356,18 @@ def ensure_gateway(cfg):
     """Reconcile gateway state with what the profile needs. Returns note str."""
     want = needs_gateway(cfg)
     if want:
+        ensure_shared_token()
         if port_open():
             ok, detail = wait_health(8)
-            return "gateway already running (%s)" % detail
+            if ok:
+                return "gateway already running (%s)" % detail
+            # Do not kill an unknown listener: report it and let the user decide.
+            return ("port %d unusable: %s - stop what holds it, then run "
+                    "`ccswitch gateway`" % (GW_PORT, detail))
         start_gateway()
         ok, detail = wait_health(25)
         if not ok:
-            return "gateway FAILED to start -> see %s" % GATEWAY_LOG
+            return "gateway FAILED to start -> see %s (%s)" % (GATEWAY_LOG, detail)
         return "gateway started -> %s" % detail
     else:
         if port_open():
@@ -389,8 +466,11 @@ def cmd_switch(arg, no_gateway=False):
 def cmd_gateway():
     if port_open():
         ok, detail = wait_health(8)
-        out("Gateway   : already running (%s)" % detail)
-        return
+        if ok:
+            out("Gateway   : already running (%s)" % detail)
+            return
+        die("port %d is not served by ccproxy: %s - stop that process first"
+            % (GW_PORT, detail))
     start_gateway()
     ok, detail = wait_health(25)
     if ok:

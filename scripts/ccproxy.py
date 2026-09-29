@@ -22,9 +22,11 @@ Config: ~/.claude-code-proxy.json (see DEFAULT_CONFIG below)
 Usage: python ccproxy.py [--port N] [--upstream URL] [--model NAME]
 """
 import argparse
+import hmac
 import http.client
 import json
 import os
+import secrets
 import ssl
 import sys
 import time
@@ -45,7 +47,15 @@ DEFAULT_CONFIG = {
     "drop_reasoning": True,
     "timeout": 900,
     "verbose": False,
+    # Shared secret that local clients must present. Auto-generated on first
+    # start so that no other local process can silently use the upstream
+    # credential this gateway is configured with. Keep it in sync with the
+    # ANTHROPIC_AUTH_TOKEN your client sends (ccswitch.py does this for you).
+    "client_token": "",
 }
+
+# Values that must never be accepted as a real token.
+PLACEHOLDER_TOKENS = {"", "router-local", "local", "changeme", "your-token"}
 
 STOP_MAP = {
     "stop": "end_turn",
@@ -78,6 +88,54 @@ def load_config():
         except Exception as e:
             sys.stderr.write("[ccproxy] bad config %s: %s\n" % (CONFIG_PATH, e))
     return cfg
+
+
+def save_client_token(token):
+    """Persist only the client token, leaving the user's other settings alone.
+
+    Command-line overrides (port, upstream, verbose) must not leak into the
+    config file, so we re-read what is on disk and patch a single key.
+    """
+    user = {}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                user = json.load(f)
+        except Exception:
+            user = {}
+    if not isinstance(user, dict):
+        user = {}
+    user["client_token"] = token
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(user, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        try:
+            os.chmod(CONFIG_PATH, 0o600)
+        except OSError:
+            pass
+    except OSError as e:
+        sys.stderr.write("[ccproxy] cannot persist token to %s: %s\n"
+                         % (CONFIG_PATH, e))
+
+
+def ensure_client_token(cfg):
+    """Return the shared client token, generating one on first start.
+
+    Without a token the gateway answers any local process, which could then
+    spend the configured upstream credential on its own prompts. Generating it
+    here keeps the default install safe without any setup step.
+    """
+    token = str(cfg.get("client_token") or "").strip()
+    if token in PLACEHOLDER_TOKENS:
+        token = secrets.token_urlsafe(24)
+        cfg["client_token"] = token
+        save_client_token(token)
+        sys.stderr.write(
+            "[ccproxy] generated a client token and saved it to %s\n"
+            "[ccproxy] clients must present it as x-api-key "
+            "(or Authorization: Bearer)\n" % CONFIG_PATH)
+    return token
 
 
 CONFIG = {}
@@ -481,10 +539,43 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(code, {"type": "error",
                                "error": {"type": kind, "message": message}})
 
+    # -- auth --------------------------------------------------------------
+    def _presented_token(self):
+        tok = (self.headers.get("x-api-key") or "").strip()
+        if not tok:
+            auth = self.headers.get("Authorization") or ""
+            if auth.lower().startswith("bearer "):
+                tok = auth[7:].strip()
+        return tok
+
+    def _authorized(self):
+        """Only callers that know the shared token may use this gateway."""
+        want = str(CONFIG.get("client_token") or "")
+        if not want:
+            return False
+        got = self._presented_token()
+        try:
+            return hmac.compare_digest(got, want)
+        except TypeError:            # non-ASCII token: fall back to ==
+            return got == want
+
+    def _reject_unauthorized(self):
+        self._send_error_anthropic(
+            401, "authentication_error",
+            "missing or invalid client token: send the `client_token` from "
+            "%s as x-api-key (or Authorization: Bearer). Trusted local "
+            "clients only." % CONFIG_PATH)
+
     def do_GET(self):
         if self.path.split("?")[0] in ("/health", "/", "/status"):
+            if not self._authorized():
+                self._reject_unauthorized()
+                return
             self._send_json(200, {
                 "ok": True,
+                "service": "ccproxy",
+                "pid": os.getpid(),
+                "auth": "token",
                 "upstream": CONFIG["upstream"].get("url"),
                 "model": CONFIG["upstream"].get("model"),
             })
@@ -495,6 +586,10 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path != "/v1/messages":
             self._send_error_anthropic(404, "not_found_error", "unsupported path " + path)
+            return
+
+        if not self._authorized():
+            self._reject_unauthorized()
             return
 
         length = int(self.headers.get("Content-Length") or 0)
@@ -619,12 +714,21 @@ def main():
     if args.verbose:
         CONFIG["verbose"] = True
 
+    ensure_client_token(CONFIG)
+
     host, port = CONFIG["host"], CONFIG["port"]
     srv = ThreadingHTTPServer((host, port), Handler)
     srv.daemon_threads = True
     sys.stderr.write(
         "[ccproxy] listening on http://%s:%d  ->  %s (%s)\n"
         % (host, port, CONFIG["upstream"]["url"], CONFIG["upstream"]["model"]))
+    sys.stderr.write("[ccproxy] auth required: send the client token from %s\n"
+                     % CONFIG_PATH)
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        sys.stderr.write(
+            "[ccproxy] WARNING: %s is not a loopback address - this gateway "
+            "would be reachable from the network and could spend your "
+            "upstream credential. Prefer 127.0.0.1.\n" % host)
     if not CONFIG["upstream"].get("api_key"):
         sys.stderr.write("[ccproxy] upstream api_key is empty (keyless upstream)\n")
     sys.stderr.flush()

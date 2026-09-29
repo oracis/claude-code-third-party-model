@@ -2,12 +2,12 @@
 name: claude-code-third-party-model
 slug: claude-code-third-party-model
 displayName: Claude Code 接入第三方模型
-version: 1.1.1
+version: 1.1.2
 license: MIT
 category: dev-programming
 subCategories: [dev-script, dev-bug-fix]
 platforms: [WorkBuddy, Claude Code, Codex]
-description: 把本地 Claude Code 接到第三方端点——分两路：① 原生 Anthropic 兼容端点（DeepSeek / Kimi / GLM）直接改 ANTHROPIC_BASE_URL；② 只有 OpenAI 兼容端点的模型（Space Bunny / 各类 stealth 模型）必须加本地网关做 Anthropic→OpenAI 协议转换 —— **用自建零依赖 `ccproxy.py`**（claude-code-router 2.1.1 的流式 SSE 输出畸形、已弃用）。并诊断「模型名写对了却不生效」「配置被别处覆盖」「未知模型告警」「连第三方后变慢」「API Error: The response stream was malformed」五类问题。当用户说「给 claude code 配置 deepseek/别的模型」「claude code 换模型不生效」「ANTHROPIC_BASE_URL 怎么设」「unrecognized_model 警告」「claude code 连 deepseek 很慢」「effort 设多少」「要不要开 max」「把 OpenRouter 上的某某模型接进 claude code」「space bunny 怎么接」「响应流畸形/回答不完整/流式报错」时使用。也覆盖**多 profile 一键切换**（`ccswitch.py`：「切 deepseek」「切 space bunny」「现在什么模型」）。含模型 ID 实测法、配置优先级判定法、Windows 注册表排查、用本地中继抓真实请求做性能归因、claude-code-router 的 config-router.json 文件名陷阱、自建网关的规范 SSE 生成法。
+description: 把本地 Claude Code 接到第三方端点——分两路：① 原生 Anthropic 兼容端点（DeepSeek / Kimi / GLM）直接改 ANTHROPIC_BASE_URL；② 只有 OpenAI 兼容端点的模型（Space Bunny / 各类 stealth 模型）必须加本地网关做 Anthropic→OpenAI 协议转换 —— **用自建零依赖 `ccproxy.py`**（claude-code-router 2.1.1 的流式 SSE 输出畸形、已弃用）。并诊断「模型名写对了却不生效」「配置被别处覆盖」「未知模型告警」「连第三方后变慢」「API Error: The response stream was malformed」五类问题。当用户说「给 claude code 配置 deepseek/别的模型」「claude code 换模型不生效」「ANTHROPIC_BASE_URL 怎么设」「unrecognized_model 警告」「claude code 连 deepseek 很慢」「effort 设多少」「要不要开 max」「把 OpenRouter 上的某某模型接进 claude code」「space bunny 怎么接」「响应流畸形/回答不完整/流式报错」时使用。也覆盖**多 profile 一键切换**（`ccswitch.py`：「切 deepseek」「切 space bunny」「现在什么模型」）。含模型 ID 实测法、配置优先级判定法、Windows 注册表排查、用本地中继抓真实请求做性能归因、claude-code-router 的 config-router.json 文件名陷阱、自建网关的规范 SSE 生成法与客户端令牌鉴权。
 agent_created: true
 ---
 
@@ -659,7 +659,7 @@ cd "C:/Users/<u>/.workbuddy/binaries/node/workspace"
 
 ```json
 "env": {
-  "ANTHROPIC_AUTH_TOKEN": "router-local",
+  "ANTHROPIC_AUTH_TOKEN": "<本地网关令牌>",
   "ANTHROPIC_BASE_URL": "http://127.0.0.1:3456",
   "ANTHROPIC_MODEL": "space-bunny[1m]",
   "ANTHROPIC_DEFAULT_OPUS_MODEL": "space-bunny[1m]",
@@ -672,8 +672,12 @@ cd "C:/Users/<u>/.workbuddy/binaries/node/workspace"
 }
 ```
 
-- `ANTHROPIC_AUTH_TOKEN` 填**本地哑值**即可（如 `router-local`），真 key 在网关 config 里。
-  好处：真 key 只存在一处，不随 `settings.json` 扩散。
+- `ANTHROPIC_AUTH_TOKEN` 这里是**本地网关的令牌**，不是上游真 key —— 真 key 只存在网关 config
+  一处，不随 `settings.json` 扩散。网关会校验这个令牌：不带或带错直接 401，其它本地进程
+  无法白用你的上游额度。
+- 令牌在网关**首次启动时自动生成**并写进 `~/.claude-code-proxy.json`；`ccswitch.py` 会把它
+  同步到 `settings.json` 与各网关 profile，两端始终一致（手工写 `router-local` 之类的占位值
+  也能跑，会被自动替换为真令牌）。
 - 1M 上下文的模型用 `[1m]` 后缀 + `AUTO_COMPACT_WINDOW=1000000`。
 
 ## 诊断：怎么拿完整出站请求体（关键）
@@ -757,6 +761,8 @@ python scripts/ccswitch.py <p> --no-gateway  # 只改 settings，不动网关
 4. **网关本体是 `ccproxy.py`（第七部分），不是 claude-code-router**；
    **停网关**：`netstat -ano` 找 `:3457 LISTENING` → `taskkill /F /PID`。
 5. 新增模型 = 丢一个 profile json 进去，脚本自动出现在 `list` 里。
+6. **令牌自动对齐**：网关的 `client_token` 与 `settings.json` 的 `ANTHROPIC_AUTH_TOKEN`
+   由切换器统一同步（仅在空值/占位值时生成新令牌），用户不用手抄令牌，两边也不会漂移。
 
 ## 关键提醒
 
@@ -786,19 +792,35 @@ python scripts/ccswitch.py <p> --no-gateway  # 只改 settings，不动网关
 
 | 路径 | 作用 |
 |---|---|
-| `scripts/ccproxy.py` | 网关本体（Python 3 **stdlib**，零第三方依赖，约 640 行） |
-| `scripts/ccswitch.py` | profile 切换器 + 网关启停协调（跨平台，约 430 行） |
-| `~/.claude-code-proxy.json` | 配置：`host` / `port` / `upstream{url,model,api_key}` / `timeout` / `verbose` |
+| `scripts/ccproxy.py` | 网关本体（Python 3 **stdlib**，零第三方依赖，约 740 行） |
+| `scripts/ccswitch.py` | profile 切换器 + 网关启停协调（跨平台，约 515 行） |
+| `~/.claude-code-proxy.json` | 配置：`host` / `port` / `upstream{url,model,api_key}` / `timeout` / `verbose` / `client_token` |
 | `examples/profiles/*.json` | 开箱可用的 `settings.json` 模板，拷到 `~/.claude/profiles/` |
 
 ```bash
 python ccproxy.py --port 3457 --verbose                      # 前台带日志
 python ccproxy.py --upstream <url> --model <name> --key <k>  # 临时换上游
-curl -s http://127.0.0.1:3457/health                         # {"ok":true,"upstream":...}
+curl -s -H "x-api-key: $TOKEN" http://127.0.0.1:3457/health  # {"ok":true,"service":"ccproxy",...}
 ```
 
-CLI 参数优先于配置文件。当前上游：`https://opencode.ai/zen/v1/chat/completions` +
-`space-bunny-free` + **空 api_key**（Zen 免 key；填任何占位值都会被 `AuthError: Invalid API key` 拒）。
+CLI 参数优先于配置文件（且**不会**被写回配置文件）。当前上游：
+`https://opencode.ai/zen/v1/chat/completions` + `space-bunny-free` + **空 api_key**
+（Zen 免 key；填任何占位值都会被 `AuthError: Invalid API key` 拒）。
+
+## 安全设计（默认即如此，不用额外配置）
+
+网关是本机进程与「你的上游额度」之间唯一的关口，所以默认做了这几件事：
+
+| 机制 | 做法 | 作用 |
+|---|---|---|
+| **客户端令牌鉴权** | `client_token` 首次启动自动生成（`secrets.token_urlsafe(24)`）；`/v1/messages` 与 `/health` 都校验，不符返回 401 | 其它本地进程无法把它当免费中转、白用你的上游凭证 |
+| **只监听回环地址** | 默认 `host=127.0.0.1`；若被改成非回环地址，启动时打印显式警告 | 不把网关暴露到局域网 |
+| **对端身份校验** | `ccswitch` 的健康检查要求响应里 `service == "ccproxy"`，否则判定「端口被其它进程占用」并报错，不再盲信端口 | 防止端口被别的程序占住后冒充网关、截走 prompt |
+| **不读代理环境变量** | 上游走 `http.client` | 不受系统代理影响（见第五部分） |
+| **改动有痕迹** | 令牌只写回配置文件的单个键（CLI 参数不落盘）；切档前自动备份 `settings.json` 到 `~/.claude/backups/` | 可回溯，不静默改你的环境 |
+
+边界说明：令牌存放在本机配置文件里，**同一用户下的其它进程本就能读到该文件**。它挡的是
+「本机程序顺手把网关当免费通道」，不是同用户内的强隔离；需要强隔离就用独立系统账号跑网关。
 
 ## 实现要点（照着抄，别重蹈覆辙）
 
@@ -823,11 +845,20 @@ CLI 参数优先于配置文件。当前上游：`https://opencode.ai/zen/v1/cha
    `{"role":"tool","tool_call_id":...}`**；assistant 的 `tool_use` → OpenAI `tool_calls`；
    `tools[].input_schema` → `function.parameters`；`tool_choice`：`any`→`required`、
    `tool`→`{type:function,function:{name}}`；`thinking.budget_tokens` → `reasoning_effort`。
+9. **入站先鉴权**：`do_POST` / `do_GET` 开头部用 `hmac.compare_digest` 比对 `x-api-key`
+   （或 `Authorization: Bearer`）与 `client_token`，不符返回 401 的 Anthropic 错误体。
+   少了这一步，本机任何进程都能把你的上游额度当免费 API 用。
+10. **健康检查要能证明身份**：`/health` 返回 `{"service":"ccproxy","pid":...}` 且要求令牌；
+    调用方校验 `service` 字段，端口被别人占住时报错，而不是当成「网关已就绪」。
+11. **只把令牌写回配置文件的那一个键**：CLI 覆盖项（`--port` / `--verbose` / …）不能落盘，
+    否则调试用的临时参数会污染用户配置。
 
 ## 验证方法（必做，别凭感觉）
 
 ```bash
+TOKEN=$(python -c "import json;print(json.load(open(r'C:/Users/<u>/.claude-code-proxy.json'))['client_token'])")
 curl -sN http://127.0.0.1:3457/v1/messages \
+  -H "x-api-key: $TOKEN" \
   -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
   -d '{"model":"x","max_tokens":300,"stream":true,"messages":[{"role":"user","content":"回答两个字:你好"}]}' > out.txt
 ```
@@ -836,6 +867,8 @@ curl -sN http://127.0.0.1:3457/v1/messages \
 
 | 检查项 | 期望 |
 |---|---|
+| 不带令牌打 `/health` 或 `/v1/messages` | **401**（鉴权生效，实测如此） |
+| `/health` 带令牌 | `{"ok":true,"service":"ccproxy","pid":...}` |
 | `message_start` / `message_delta` / `message_stop` 计数 | **各 1** |
 | `content_block_stop` 计数 | = `content_block_start` 计数 |
 | 首 / 末事件 | `message_start` / `message_stop` |
