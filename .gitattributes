@@ -1,0 +1,11 @@
+# Normalize line endings: store LF in the repo so scripts stay portable
+# (a CRLF shebang breaks on macOS/Linux).
+* text=auto eol=lf
+
+# Binary files - never touch
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
