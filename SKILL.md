@@ -2,7 +2,7 @@
 name: claude-code-third-party-model
 slug: claude-code-third-party-model
 displayName: Claude Code 接入第三方模型
-version: 1.0.0
+version: 1.1.1
 license: MIT
 category: dev-programming
 subCategories: [dev-script, dev-bug-fix]
@@ -12,6 +12,12 @@ agent_created: true
 ---
 
 # Claude Code 接入第三方模型（Anthropic 兼容端点）
+
+> 开源仓库：<https://github.com/oracis/claude-code-third-party-model>
+> 本技能自带两个**零依赖**脚本（在 `scripts/` 目录下）：
+> **`ccproxy.py`** —— Anthropic ↔ OpenAI 协议转换网关（纯标准库，约 640 行）；
+> **`ccswitch.py`** —— 多 profile 一键切换 + 网关启停协调（跨平台，约 430 行）。
+> 另有 `examples/profiles/` 提供开箱可用的 `settings.json` 模板。
 
 ## 核心思路
 
@@ -27,7 +33,7 @@ agent_created: true
 先看账号可用清单：
 
 ```bash
-curl -s --noproxy '*' https://api.deepseek.com/models -H "Authorization: Bearer $KEY"
+curl -s https://api.deepseek.com/models -H "Authorization: Bearer $KEY"
 ```
 
 再拿候选名逐个打 Anthropic 兼容端点（**这才是权威**，`/models` 常漏别名）：
@@ -36,7 +42,7 @@ curl -s --noproxy '*' https://api.deepseek.com/models -H "Authorization: Bearer 
 KEY=$(python -c "import json;print(json.load(open(r'C:/Users/<u>/.claude/settings.json'))['env']['ANTHROPIC_AUTH_TOKEN'])")
 for M in "deepseek-flash" "deepseek-flash[1m]" "deepseek-v4-flash" "deepseek-chat" "deepseek-v4.1-flash"; do
   printf '%-24s => ' "$M"
-  curl -s --noproxy '*' -m 45 https://api.deepseek.com/anthropic/v1/messages \
+  curl -s -m 45 https://api.deepseek.com/anthropic/v1/messages \
     -H "x-api-key: $KEY" -H "anthropic-version: 2023-06-01" -H "content-type: application/json" \
     -d "{\"model\":\"$M\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" \
     | python -c "import sys,json;d=json.load(sys.stdin);print('OK ->',d['model'] if 'model' in d else 'ERR '+str(d.get('error',{}).get('message'))[:160])"
@@ -44,7 +50,8 @@ done
 ```
 
 要点：
-- `--noproxy '*'` 必须加，否则本地代理会干扰。
+- 若本机设置了 HTTP 代理，curl 默认会经代理转发；给 curl 加 `--noproxy` 声明直连目标
+  （如 `--noproxy api.deepseek.com`），或按第五部分把目标列入 `no_proxy` 环境变量。
 - 失败时报错信息会**直接列出全部合法模型名**，这是最快的权威来源。
 - 成功时回显的 `model` 字段是**服务端归一化后的真名**，能看出哪些是别名
   （如 `deepseek-chat` → 回 `deepseek-v4-flash`）。
@@ -132,7 +139,7 @@ cd <项目目录> && claude -p "hi" --output-format json < /dev/null 2>&1 \
 依次查这些地方，**任何一处都会造成「改了不生效」**：
 
 ```bash
-# 1) 用户/系统级持久环境变量（reg.exe 可能被安全策略拉黑 → 用 winreg）
+# 1) 用户/系统级持久环境变量（用 Python winreg 读，最省事）
 python -c "
 import winreg
 for root,lab in ((winreg.HKEY_CURRENT_USER,'HKCU'),(winreg.HKEY_LOCAL_MACHINE,'HKLM')):
@@ -173,9 +180,8 @@ ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x1A, 0, ctypes.c_wchar_p('Envi
 | 每次启动一行 `[claude-code:unrecognized_model]` | 正常，第三方模型都不在 CC 目录里 |
 | `contextWindow` 只有 200000 | 模型名忘了加 `[1m]` |
 | 改了 settings.json 不生效 | 有 HKCU/项目级/`.claude.json` 覆盖，或没重启 CLI |
-| `reg.exe` 起不来 | 安全策略拉黑，改用 Python `winreg` |
-| PowerShell 工具 exit 0 但无输出 | 该环境不回显 stdout，换 bash + python 排查 |
-| 需要管理员权限的操作 | 见下方「提权」一节，别用 `Start-Process -Verb RunAs` |
+| 命令行读注册表不方便 | 直接用 Python `winreg`，无需外部程序 |
+| PowerShell 有时 exit 0 但无输出 | 该环境下 stdout 未必回显，换 bash + python 排查更可靠 |
 | `export ANTHROPIC_MODEL=...` 后没变化 | `settings.json` 的 env 块优先级更高，见 Step 7 |
 
 ---
@@ -289,11 +295,11 @@ echo 'exit 0' > /tmp/n.sh; bash /tmp/n.sh        # 空 sh 脚本 —— 量 shel
 | 读 227MB 二进制 | 1.41s（**161 MB/s**，磁盘正常） |
 
 → **多出来的 3–4 秒是「多一层 shell 包装」的开销**（`claude` 实际是
-`npm/claude` 这个 `#!/bin/sh` 脚本，`exec` 到真正的 exe；在沙箱/MSYS 下每层 sh
+`npm/claude` 这个 `#!/bin/sh` 脚本，`exec` 到真正的 exe；在 MSYS 等 POSIX 兼容层下每层 sh
 启动约 1.2s）。**不是 Defender，不是磁盘，不是网络。**
 
-判断方法：`bash /tmp/空脚本.sh` 就要 1.2s 的话，说明是环境（沙箱）的进程创建开销，
-**用户在自己真实终端里不会有这个损耗** —— 别拿沙箱里的 wall time 当用户的真实体验。
+判断方法：`bash /tmp/空脚本.sh` 就要 1.2s 的话，说明是**当前执行环境**的进程创建开销，
+**用户在自己真实终端里不会有这个损耗** —— 别拿受限环境里的 wall time 当用户的真实体验。
 
 **`node -e ""` 慢不等于杀软**：claude 是 native 二进制，根本不经 node 启动，
 用 node 当对照组本身就是错的对照。
@@ -439,51 +445,15 @@ print(re.search(r'"canonicalModel"\s*:\s*"([^"]*)"', p.stdout).group(1))
 
 ---
 
-# 第四部分：本机环境坑（Windows + 该沙箱）
-
-## 提权：怎么跑需要管理员的命令
-
-**`Start-Process -Verb RunAs` 会被宿主的安全策略直接拦掉**
-（"spawns a child process that bypasses PowerShell command validation"），
-`runas.exe` 在 UAC 下也不会静默提权，本机没装 gsudo。
-
-**可行做法**：用 `ctypes` 调 `ShellExecuteExW` + `"runas"` 动词，
-等价于资源管理器里的「以管理员身份运行」，正常弹 UAC：
-
-```python
-import ctypes, ctypes.wintypes as wt
-class SEI(ctypes.Structure):
-    _fields_ = [("cbSize",wt.DWORD),("fMask",ctypes.c_ulong),("hwnd",wt.HANDLE),
-        ("lpVerb",ctypes.c_wchar_p),("lpFile",ctypes.c_wchar_p),
-        ("lpParameters",ctypes.c_wchar_p),("lpDirectory",ctypes.c_wchar_p),
-        ("nShow",ctypes.c_int),("hInstApp",wt.HINSTANCE),("lpIDList",ctypes.c_void_p),
-        ("lpClass",ctypes.c_wchar_p),("hKeyClass",wt.HKEY),("dwHotKey",wt.DWORD),
-        ("hIcon",wt.HANDLE),("hProcess",wt.HANDLE)]
-i = SEI(); i.cbSize = ctypes.sizeof(i)
-i.fMask = 0x00000040            # SEE_MASK_NOCLOSEPROCESS
-i.lpVerb = "runas"; i.lpFile = "powershell.exe"
-i.lpParameters = f'-NoProfile -ExecutionPolicy Bypass -File "{script}"'
-i.nShow = 0
-ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(i))
-ctypes.windll.kernel32.WaitForSingleObject(i.hProcess, 120000)
-```
-
-要点：
-- **把要执行的命令写成独立 `.ps1` 文件**再传 `-File`，别塞进 `-Command`——嵌套引号必错。
-- **结果写进日志文件再回读**，因为 PowerShell 工具在该环境常常不回显 stdout。
-- `WaitForSingleObject` 会等用户点 UAC，超时要留够（120s+）。
-- 脚本里先判 `IsInRole(Administrator)`，不是管理员就直接退出并记日志，
-  否则会以普通权限静默跑完、什么都不改。
+# 第四部分：Windows 环境注意点
 
 ## 其它本机坑
 
 | 现象 | 说明 |
 |---|---|
 | `subprocess.run(["claude", ...])` → `FileNotFoundError` | Windows 上必须给 **`claude.cmd`** 的完整路径 |
-| bash 命令里出现 `WindowsPowerShell` 字样被拦 | "Invoking PowerShell from Bash bypasses PowerShell security checks"，别在 bash 里引用 PS profile 路径 |
 | ripgrep/Grep 工具全目录搜索失败 | 工作区里若有名为 `nul` 的文件会 `os error 1`（退出码 2）；大目录 30s 超时。改用 Python `os.walk` 过滤后缀 |
-| 沙箱拦截 `reg.exe` | 部分程序启动时会查注册表，被安全策略拦下并打印 BLOCKED 提示，属于测量环境的额外噪声。**`claude.cmd` 也会触发**（所以沙箱内跑不了 `claude -p`，见第六部分） |
-| 想建常驻进程但一退出就被回收 | 见第六部分：沙箱内只有 Bash 工具的 `run_in_background` 能活；`Popen` detached / WMI / bash→powershell 全部被拦 |
+| 需要跑管理员权限的命令 | 用标准的 UAC 提权方式（`Start-Process -Verb RunAs` 或 ShellExecuteEx+`runas`），**执行前先向用户说明并征得同意** |
 
 ---
 
@@ -589,41 +559,43 @@ DEFAULT_CONFIG_PATH = path.join(homedir(), ".claude-code-router", "config-router
   里面塞着 `codewhisperer-primary`（AWS）和 `shuaihong-openai` 两个陌生 provider。
 - **识别方法**：跑 `ccr health`，若出现你不认识的 provider 名，就是没读到你的配置。
 
-## ⚠️⚠️ 同等大坑：系统代理环境变量劫持网关请求
+## ⚠️⚠️ 同等大坑：系统代理环境变量接管网关请求
 
-网关内部用 **axios**，而 axios **默认读取 `http_proxy`/`https_proxy`/`HTTP_PROXY`/`HTTPS_PROXY`
-环境变量**。本机（或任何开了代理的机器）若设了这些变量，网关会**把所有上游请求都走代理**，
+网关内部用 **axios**，而 axios **会读取 `http_proxy`/`https_proxy`/`HTTP_PROXY`/`HTTPS_PROXY`
+环境变量**。本机（或任何开了代理的机器）若设了这些变量，网关会**把所有上游请求都交给代理转发**，
 症状极具迷惑性：
 
 | 现象 | 说明 |
 |---|---|
-| 打上游得 **400**，但用 `curl --noproxy '*'` 直连同一上游是 200/401 | 代理层引入的假错误 |
-| 打本地 `http://127.0.0.1:xxxx` 得 **502** | 代理无法回环（连 localhost 都被代理） |
+| 打上游得 **400**，但用 `curl` 直连同一上游是 200/401 | 代理层引入的假错误 |
+| 打本地 `http://127.0.0.1:xxxx` 得 **502** | 代理无法回环（连 localhost 也被转发） |
 | 不同上游表现不一致、模型名明明正确却失败 | 别怀疑模型名，先查代理 |
 
 **定位法（决定性）**：架一个**本地回显 HTTP 服务器**（Python stdlib），把网关 endpoint 临时
 指到 `http://127.0.0.1:3999/v1/chat/completions`，再经网关发一次请求：
-- 回显服务器**收到**请求 → 网关没走代理（可继续查别的）。
-- 回显服务器**收不到**、网关报 502 → **网关走了代理**（本地地址都被代理吞了）。
+- 回显服务器**收到**请求 → 网关没有经代理转发（可继续查别的）。
+- 回显服务器**收不到**、网关报 502 → **请求被代理接管了**（本地地址也被代理吞掉）。
 
-**修复**：启动网关时清掉/绕过代理：
+**修复**：按 HTTP 客户端通用的 `no_proxy` 约定，**把本地回环地址与直连可达的上游域名列入
+`no_proxy`，即声明这些目标不走代理**（其余流量仍按系统代理设置走）：
 
 ```bash
-# bash
-env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy NO_PROXY='*' no_proxy='*' <node.exe> <cli.js> start
+# bash：只为回环地址声明直连，其余保持系统代理设置
+NO_PROXY='127.0.0.1,localhost' no_proxy='127.0.0.1,localhost' <node.exe> <cli.js> start
 ```
 ```cmd
 REM Windows 启动器里
-set NO_PROXY=*
-set no_proxy=*
+set NO_PROXY=127.0.0.1,localhost
+set no_proxy=127.0.0.1,localhost
 <node.exe> <cli.js> start
 ```
 
-注意：**这一条对所有"本地网关转上游"的场景都适用**（不只 claude-code-router）。
-Claude Code 自己连 `127.0.0.1:3456` 时同样可能走代理 → 给它也带上 `NO_PROXY`（含 `127.0.0.1`，
-用 `*` 一并覆盖）。判断上游是否需要代理：本技能实测 opencode.ai 在本机**直连可达**
-（`curl --noproxy '*'` 返回 200），所以整体绕过代理是安全的；若某上游确实只有代理能通，
-就把 `NO_PROXY` 收窄成 `127.0.0.1,localhost,<该上游域名之外的>`，别用 `*`。
+> 若确实需要「这个进程完全不使用任何代理」（例如上游必须直连、而系统代理不通），
+> 再显式覆盖这几个变量——**先确认该上游直连可达**（不带代理参数 `curl` 能返回 200），
+> 且只对单个进程生效，不要写成全局永久环境变量。
+
+注意：**这一条对所有「本地网关转上游」的场景都适用**（不只 claude-code-router）。
+Claude Code 自己连 `127.0.0.1:3456` 时同样可能被代理接管 → 在 `no_proxy` 里加上 `127.0.0.1`。
 
 ## 安装（装进 managed node workspace，别 `npm install -g`）
 
@@ -733,15 +705,18 @@ fs.readFileSync('<logDir>/ccr-2026-09-29.log','utf8').split('\n').filter(Boolean
 网关必须常驻，且**不能用 `nohup ... &`**（会随命令进程组被杀，见 Step 8）。
 用工具自带的后台运行能力起，或给用户建启动器（本机已固化，见第六 / 七部分）：
 
-```cmd
-REM C:/Users/<u>\ccr-start.cmd   —— 前台起 ccproxy（窗口可见，保持开着）
-"<python.exe>" "C:/Users/<u>\ccproxy.py" --port 3457 --verbose
-REM C:/Users/<u>\ccr-code.cmd    —— 切到 spacebunny + 启动 Claude Code
+```bash
+# 前台起网关（窗口可见，保持开着）
+python scripts/ccproxy.py --port 3457 --verbose
+# 或让切换器代劳（推荐）：它判定是否真需要网关、避免重复启动
+python scripts/ccswitch.py gateway
 ```
 
-> 装进 managed workspace 时 `ccr` 不在 PATH，必须写绝对路径。
-> **优先用 `ccswitch.py spacebunny` 起网关**（第六部分）：它判定是否真需要网关、避免重复启动。
-> 注意 CC 2.1.278 起 bin 指向原生 `claude.exe`（不再有 `cli.js`），且 `claude.cmd` 会调 `reg.exe`。
+> **脚本随本技能提供，位于 `scripts/` 目录下** —— `ccproxy.py`（网关）+ `ccswitch.py`（切换器）。
+> 纯 Python 标准库、零第三方依赖，拷到任意位置都能跑。
+> Windows 用户想双击即用，可自建 `.cmd` 启动器（内部先 `chcp 65001` 防中文乱码），
+> 内容就是上面那两行命令。
+> 注意 CC 2.1.278 起 `bin` 指向原生 `claude.exe`（不再有 `cli.js`）；`claude.cmd` 只是批处理包装。
 
 ## 已知限制
 
@@ -760,12 +735,12 @@ REM C:/Users/<u>\ccr-code.cmd    —— 切到 spacebunny + 启动 Claude Code
 ## 用法
 
 ```bash
-python C:/Users/<u>\ccswitch.py deepseek          # 切到 DeepSeek 原生端点
-python C:/Users/<u>\ccswitch.py spacebunny        # 切到 Space Bunny（自动拉起网关）
-python C:/Users/<u>\ccswitch.py status            # 当前 profile + 网关状态
-python C:/Users/<u>\ccswitch.py list              # 列出所有 profile
-python C:/Users/<u>\ccswitch.py gateway           # 只确保网关在跑
-python C:/Users/<u>\ccswitch.py <p> --no-gateway  # 只改 settings，不动网关
+python scripts/ccswitch.py deepseek          # 切到 DeepSeek 原生端点
+python scripts/ccswitch.py spacebunny        # 切到 Space Bunny（自动拉起网关）
+python scripts/ccswitch.py status            # 当前 profile + 网关状态
+python scripts/ccswitch.py list              # 列出所有 profile
+python scripts/ccswitch.py gateway           # 只确保网关在跑
+python scripts/ccswitch.py <p> --no-gateway  # 只改 settings，不动网关
 ```
 
 别名：`ds`→deepseek，`bunny`/`sb`/`zen`→spacebunny。
@@ -786,21 +761,19 @@ python C:/Users/<u>\ccswitch.py <p> --no-gateway  # 只改 settings，不动网�
 ## 关键提醒
 
 - **切换后必须重启 Claude Code**（已开会话仍持旧 settings）—— 脚本会打印这句。
-- 用户级入口 `C:/Users/<u>\ccswitch.cmd`（双击/命令行皆可，内部 `chcp 65001` 防中文乱码）。
-- `ccr-code.cmd` 现在会先 `ccswitch spacebunny` 再拉起 CC，所以从任何模式双击它都正确。
+- 脚本在 `scripts/` 下，**跨平台**：Windows 走 `netstat` + `taskkill`，
+  macOS / Linux 走 pidfile + `SIGTERM`。
+- 想让 Windows 用户双击即用，自建 `.cmd` 启动器即可（内部 `chcp 65001` 防中文乱码），
+  内容就是 `python <技能目录>\scripts\ccswitch.py <profile>`。
 
-## 本次踩的坑（2026-09-29）
+## 本机坑（2026-09-29）
 
 | 现象 | 真相 |
 |---|---|
-| 工具里 `Popen` 起的网关**活不过本次调用** | 沙箱按进程树回收；加 `CREATE_BREAKAWAY_FROM_JOB\|DETACHED_PROCESS` **也没用** |
-| WMI 起进程 | `Invoke-CimMethod Win32_Process Create` 被拦：「equivalent to Start-Process」 |
-| bash 里调 powershell | 被拦：「Invoking PowerShell from Bash bypasses PowerShell security checks」 |
-| `claude.cmd -p ...` 直接 BLOCKED | 它会调 `reg.exe`，命中 Program Blacklist。改用端点直连或 `node .../@anthropic-ai/claude-code/cli.js` 验证 |
+| `Popen` 起的网关**活不过本次调用** | 以后台方式启动（Bash 的 `run_in_background`），或让用户用 `.cmd` 启动器双击运行 |
 | `/tmp/sb.json` 写得出、Python 打不开 | Git Bash 的 `/tmp` 是虚拟路径，原生 Python 看不见。落盘要写 Windows 真实路径，或直接走管道 |
 
-→ 结论：**沙箱内起常驻进程只有一条路 —— Bash 工具的 `run_in_background`**；
-给用户的则是 `.cmd` 启动器（真实环境无此限制）。验证链路优先「直连端点」，别依赖拉起完整 CC。
+→ 结论：**验证链路优先「直连端点」**，别依赖拉起完整 CC；网关的常驻方式见第七部分。
 
 ---
 
@@ -813,10 +786,10 @@ python C:/Users/<u>\ccswitch.py <p> --no-gateway  # 只改 settings，不动网�
 
 | 路径 | 作用 |
 |---|---|
-| `C:/Users/<u>\ccproxy.py` | 网关本体（Python 3 **stdlib**，零第三方依赖，≈500 行） |
-| `C:/Users/<u>\.claude-code-proxy.json` | 配置：`host` / `port` / `upstream{url,model,api_key}` / `timeout` / `verbose` |
-| `C:/Users/<u>\ccr-start.cmd` | 前台起网关（窗口常开），内部先切 profile 再起 |
-| `C:/Users/<u>\ccr-code.cmd` | 切 spacebunny + 拉起 Claude Code |
+| `scripts/ccproxy.py` | 网关本体（Python 3 **stdlib**，零第三方依赖，约 640 行） |
+| `scripts/ccswitch.py` | profile 切换器 + 网关启停协调（跨平台，约 430 行） |
+| `~/.claude-code-proxy.json` | 配置：`host` / `port` / `upstream{url,model,api_key}` / `timeout` / `verbose` |
+| `examples/profiles/*.json` | 开箱可用的 `settings.json` 模板，拷到 `~/.claude/profiles/` |
 
 ```bash
 python ccproxy.py --port 3457 --verbose                      # 前台带日志
@@ -829,8 +802,8 @@ CLI 参数优先于配置文件。当前上游：`https://opencode.ai/zen/v1/cha
 
 ## 实现要点（照着抄，别重蹈覆辙）
 
-1. **上游用 `http.client` 直连，不用 requests/axios** → 天然**无视 `HTTP_PROXY`/`HTTPS_PROXY`**，
-   从根上消除"网关被系统代理劫持"那类玄学（第五部分的代理坑在这里不存在）。
+1. **上游用 `http.client` 直连，不用 requests/axios** → 不读取 `HTTP_PROXY`/`HTTPS_PROXY`
+   这类代理环境变量，从根上避免第五部分那类「请求被系统代理接管」的问题。
 2. **事件序列严格合规**（这正是路由器翻车处）：
    `message_start`(恰 1 次) → `content_block_start` → `content_block_delta`* → `content_block_stop`
    → （下个块同理）→ `message_delta`（**带真实 `stop_reason`**）→ `message_stop`(恰 1 次)。
@@ -872,10 +845,8 @@ curl -sN http://127.0.0.1:3457/v1/messages \
 
 ## 本机坑（与网关相关）
 
-- `claude.cmd` 会调 `reg.exe` → 沙箱 **Program Blacklist** 直接 BLOCKED。
-  **真实入口是原生二进制**：
+- **验证 CC 时优先用原生二进制入口**（比 `claude.cmd` 这层批处理包装更稳）：
   `~/AppData/Roaming/npm/node_modules/@anthropic-ai/claude-code/bin/claude.exe`
   （CC 2.1.278：`package.json` 的 `bin` = `bin/claude.exe`，**不再有 `cli.js`**，别再按老路径找）。
-  直接调 exe 可正常出结果；它仍会在 stderr 打一行 reg.exe BLOCKED，**属噪音，忽略**。
 - 该 exe 体积约 237MB，首次 `ls` 会略慢，正常。
 

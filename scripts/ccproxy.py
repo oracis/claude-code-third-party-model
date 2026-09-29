@@ -12,7 +12,8 @@ Why this exists:
 What it does:
     POST /v1/messages   (Anthropic Messages API, what Claude Code speaks)
       -> translated into an OpenAI /chat/completions request
-      -> sent upstream with http.client (ignores HTTP_PROXY entirely)
+      -> sent upstream with http.client, which does not read any of the
+         proxy environment variables
       -> translated back, with a strictly spec-shaped Anthropic event stream
          (message_start / content_block_* / message_delta / message_stop).
 

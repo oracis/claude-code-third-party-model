@@ -20,8 +20,9 @@ How it works:
       * any other profile (native Anthropic endpoint, e.g. DeepSeek)
         => gateway is not needed -> stop it to keep things clean
 
-    The gateway is started with NO_PROXY=* and the proxy env vars stripped,
-    so a system-wide http_proxy can never hijack either hop.
+    The gateway child process is launched with proxy environment variables
+    cleared and NO_PROXY set to the loopback addresses it serves, so the
+    gateway always talks to its upstream directly.
 """
 
 import json
@@ -85,8 +86,9 @@ ALIASES = {
 DETACHED_PROCESS = 0x00000008
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 CREATE_BREAKAWAY_FROM_JOB = 0x01000000
-# Breakaway is essential: without it the gateway dies with the parent's job
-# object (e.g. a sandboxed shell), leaving Claude Code pointed at a dead port.
+# Breakaway keeps the gateway alive after the launcher exits (otherwise it can
+# be torn down together with the parent process), leaving Claude Code pointed
+# at a dead port. DETACHED_PROCESS covers plain console launches.
 DETACHED = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB
 
 # ------------------------------------------------------------------- output
@@ -218,15 +220,15 @@ def start_gateway():
     for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
               "ALL_PROXY", "all_proxy"):
         env.pop(k, None)
-    env["NO_PROXY"] = "*"
-    env["no_proxy"] = "*"
+    env["NO_PROXY"] = "127.0.0.1,localhost"
+    env["no_proxy"] = "127.0.0.1,localhost"
     argv = [str(PY_EXE), str(CCPROXY), "--port", str(GW_PORT)]
     log = open(GATEWAY_LOG, "ab", buffering=0)
     kw = dict(cwd=str(CCPROXY.parent), stdin=subprocess.DEVNULL,
               stdout=log, stderr=log, env=env, close_fds=True)
     if os.name == "nt":
-        # Breakaway keeps the gateway alive when our job object goes away;
-        # without it Claude Code is left pointing at a dead port.
+        # Keep the gateway running after this launcher exits, so Claude Code
+        # is never left pointing at a dead port.
         try:
             proc = subprocess.Popen(argv, creationflags=DETACHED, **kw)
         except OSError:
@@ -241,13 +243,14 @@ def start_gateway():
         pass
 
 
-def proxy_bypass_opener():
+def direct_opener():
+    """urllib opener with no proxy handler, for 127.0.0.1 health checks."""
     return urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def wait_health(timeout=25.0):
     """Poll the gateway until it answers, return (ok, detail)."""
-    op = proxy_bypass_opener()
+    op = direct_opener()
     deadline = time.time() + timeout
     last = ""
     while time.time() < deadline:
