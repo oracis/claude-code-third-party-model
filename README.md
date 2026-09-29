@@ -46,14 +46,16 @@
 ```bash
 # 1) 起网关（零依赖，Python 3 标准库，无需 pip install）
 python scripts/ccproxy.py --port 3457 --upstream https://opencode.ai/zen/v1/chat/completions --model space-bunny-free
+#    首次启动会生成一个客户端令牌，存进 ~/.claude-code-proxy.json
 
-# 2) 另开一个终端，确认网关活着
-curl -s http://127.0.0.1:3457/health
+# 2) 另开一个终端，带令牌确认网关活着（不带令牌会返回 401）
+TOKEN=$(python -c "import json,os;print(json.load(open(os.path.expanduser('~/.claude-code-proxy.json')))['client_token'])")
+curl -s -H "x-api-key: $TOKEN" http://127.0.0.1:3457/health
 
 # 3) 把 Claude Code 指到网关
 #    ~/.claude/settings.json
 #    "ANTHROPIC_BASE_URL": "http://127.0.0.1:3457"
-#    "ANTHROPIC_AUTH_TOKEN": "router-local"     <-- 本地哑值即可，真 key 在网关配置里
+#    "ANTHROPIC_AUTH_TOKEN": "<上面那个 client_token>"   <-- 真 key 在网关配置里，令牌由 ccswitch 自动同步
 ```
 
 配置也可以落盘到 `~/.claude-code-proxy.json`，之后直接 `python scripts/ccproxy.py` 就用它：
@@ -101,7 +103,7 @@ CLI 参数优先于配置文件：
 ```bash
 python scripts/ccproxy.py --port 3457 --verbose                       # 前台带日志
 python scripts/ccproxy.py --upstream <url> --model <name> --key <k>   # 临时换上游
-curl -s http://127.0.0.1:3457/health                                  # {"ok":true,"upstream":...}
+curl -s -H "x-api-key: <client_token>" http://127.0.0.1:3457/health   # {"ok":true,"service":"ccproxy","upstream":...}
 ```
 
 ### `scripts/ccswitch.py` — 一句话切换模型
@@ -128,6 +130,29 @@ python scripts/ccswitch.py gateway       # 只确保网关在跑，不切换
 cp examples/profiles/*.json ~/.claude/profiles/
 # 然后编辑 deepseek.json 填上你自己的 key
 ```
+
+### 顺带：把同一个模型配进 WorkBuddy 客户端
+
+除了 Claude Code，WorkBuddy 也可以在「配置自定义模型」里直接选第三方模型，落盘在
+`~/.workbuddy/models.json`：
+
+```json
+{
+  "id": "space-bunny-free",
+  "name": "Space Bunny",
+  "vendor": "OpenCode Zen",
+  "url": "https://opencode.ai/zen/v1/chat/completions",
+  "apiKey": " ",
+  "supportsToolCall": true,
+  "supportsReasoning": true
+}
+```
+
+> ⚠️ **`apiKey` 不能留空字符串**。为空时客户端会回落到自己的平台 token，当成
+> `Authorization: Bearer <平台 token>` 发给上游，匿名端点直接回 `401 Invalid API key.`
+> （错误码 3001、`custom_model_auth`），而报错文案会误导你去检查「API Key、模型 ID、接口地址」。
+> 修法是填**一个 ASCII 空格**——匿名端点先 trim 再判空，照常放行。
+> 注意必须是 ASCII 空格/Tab，`\xa0` 之类的全角空白无效。细节见 `SKILL.md`。
 
 ---
 

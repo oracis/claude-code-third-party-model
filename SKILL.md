@@ -2,12 +2,12 @@
 name: claude-code-third-party-model
 slug: claude-code-third-party-model
 displayName: Claude Code 接入第三方模型
-version: 1.1.2
+version: 1.1.3
 license: MIT
 category: dev-programming
 subCategories: [dev-script, dev-bug-fix]
 platforms: [WorkBuddy, Claude Code, Codex]
-description: 把本地 Claude Code 接到第三方端点——分两路：① 原生 Anthropic 兼容端点（DeepSeek / Kimi / GLM）直接改 ANTHROPIC_BASE_URL；② 只有 OpenAI 兼容端点的模型（Space Bunny / 各类 stealth 模型）必须加本地网关做 Anthropic→OpenAI 协议转换 —— **用自建零依赖 `ccproxy.py`**（claude-code-router 2.1.1 的流式 SSE 输出畸形、已弃用）。并诊断「模型名写对了却不生效」「配置被别处覆盖」「未知模型告警」「连第三方后变慢」「API Error: The response stream was malformed」五类问题。当用户说「给 claude code 配置 deepseek/别的模型」「claude code 换模型不生效」「ANTHROPIC_BASE_URL 怎么设」「unrecognized_model 警告」「claude code 连 deepseek 很慢」「effort 设多少」「要不要开 max」「把 OpenRouter 上的某某模型接进 claude code」「space bunny 怎么接」「响应流畸形/回答不完整/流式报错」时使用。也覆盖**多 profile 一键切换**（`ccswitch.py`：「切 deepseek」「切 space bunny」「现在什么模型」）。含模型 ID 实测法、配置优先级判定法、Windows 注册表排查、用本地中继抓真实请求做性能归因、claude-code-router 的 config-router.json 文件名陷阱、自建网关的规范 SSE 生成法与客户端令牌鉴权。
+description: 把本地 Claude Code 接到第三方端点——分两路：① 原生 Anthropic 兼容端点（DeepSeek / Kimi / GLM）直接改 ANTHROPIC_BASE_URL；② 只有 OpenAI 兼容端点的模型（Space Bunny / 各类 stealth 模型）必须加本地网关做 Anthropic→OpenAI 协议转换 —— **用自建零依赖 `ccproxy.py`**（claude-code-router 2.1.1 的流式 SSE 输出畸形、已弃用）。并诊断「模型名写对了却不生效」「配置被别处覆盖」「未知模型告警」「连第三方后变慢」「API Error: The response stream was malformed」五类问题。当用户说「给 claude code 配置 deepseek/别的模型」「claude code 换模型不生效」「ANTHROPIC_BASE_URL 怎么设」「unrecognized_model 警告」「claude code 连 deepseek 很慢」「effort 设多少」「要不要开 max」「把 OpenRouter 上的某某模型接进 claude code」「space bunny 怎么接」「响应流畸形/回答不完整/流式报错」时使用。也覆盖**多 profile 一键切换**（`ccswitch.py`：「切 deepseek」「切 space bunny」「现在什么模型」）。含模型 ID 实测法、配置优先级判定法、Windows 注册表排查、用本地中继抓真实请求做性能归因、claude-code-router 的 config-router.json 文件名陷阱、自建网关的规范 SSE 生成法与客户端令牌鉴权。也覆盖**把模型配进 WorkBuddy 客户端**（`~/.workbuddy/models.json`）——含「`apiKey` 留空会被回落成平台 token 导致上游 401 / 错误码 3001」这一最易踩坑的诊断与修法。
 agent_created: true
 ---
 
@@ -679,6 +679,51 @@ cd "C:/Users/<u>/.workbuddy/binaries/node/workspace"
   同步到 `settings.json` 与各网关 profile，两端始终一致（手工写 `router-local` 之类的占位值
   也能跑，会被自动替换为真令牌）。
 - 1M 上下文的模型用 `[1m]` 后缀 + `AUTO_COMPACT_WINDOW=1000000`。
+
+## 配进 WorkBuddy 客户端（`~/.workbuddy/models.json`）
+
+GUI 里「配置自定义模型」写的就是这个文件（顶层数组或 `{ "models": [ ... ] }` 都合法）。
+除了 Claude Code，也可以让 WorkBuddy 本体直接选第三方模型：
+
+```json
+{
+  "id": "space-bunny-free",
+  "name": "Space Bunny",
+  "vendor": "OpenCode Zen",
+  "url": "https://opencode.ai/zen/v1/chat/completions",
+  "apiKey": " ",
+  "supportsToolCall": true,
+  "supportsReasoning": true
+}
+```
+
+> ⚠️ **`apiKey` 不能留空字符串**（这是最容易踩的坑）。运行时（`codebuddy-headless.js`）
+> 取 key 的逻辑是：
+> ```js
+> ei = settings.env.CODEBUDDY_API_KEY || process.env.CODEBUDDY_API_KEY;  // 默认 = 平台 token
+> if (model.apiKey) ei = model.apiKey;                                   // 有值才覆盖
+> if (ei) headers['x-api-key'] = ei, headers['Authorization'] = `Bearer ${ei}`;
+> ```
+> 空串是**假值** → 不覆盖 → 客户端把自己的 **WorkBuddy 平台 token** 当 Bearer 发给上游，
+> 症状是上游回 `401 AuthError: Invalid API key.`（错误码 3001、`category: custom_model_auth`），
+> 报错信息会指向「请检查模型配置（API Key、模型 ID、接口地址）」——**全是误导**，
+> 配置一个字都没错。Claude Code 侧没有这个问题（网关自己管上游鉴权）。
+>
+> **修法：把 `apiKey` 填成单个空格 `" "`**。上游只会看到 `Authorization: Bearer  `，
+> 而**匿名型端点会先 trim 再判空**，所以照常放行。
+> 实测（`http.client` 直发，不经 curl，避免尾随空格被裁掉）：
+> `Bearer  `（token=1 空格）→ **200**；`Bearer   `→ 200；`Bearer \t` → 200；
+> **`Bearer \xa0`（非断行空格）→ 401** —— 所以必须是 ASCII 空格/Tab，别用全角或不换行空格。
+> 反例：任何**非空可见值**（含 `undefined`/`null`/`EMPTY`/`sk-`）一律 401。
+>
+> 相关环境变量（排查用）：`CODEBUDDY_API_KEY`（key 本体）、
+> `CODEBUDDY_API_KEY_DISABLED=1`（**设了则整套 key 逻辑短路、完全不发 Authorization 头** ——
+> 这是最"干净"的关掉方式，但它会同时影响 WorkBuddy 自己的内置模型，慎用）；
+> `CODEBUDDY_CUSTOM_HEADERS`（附加自定义头）、`CODEBUDDY_DISABLE_CUSTOM_MODELS_FILE=1`（不读 models.json）。
+>
+> `models.json` 的用户级文件**有 watcher（1s 去抖）+ 每次请求重新读 config**，
+> 改完通常**不必重启客户端**，直接重发即可；不行再重启。用户级 `apiKey` 还可能在
+> 保存时被凭据编解码加密（`WBEF1` 前缀），读到明文不受影响。
 
 ## 诊断：怎么拿完整出站请求体（关键）
 
