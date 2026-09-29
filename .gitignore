@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime artifacts
+*.log
+.claude-code-proxy.pid
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
