@@ -74,6 +74,16 @@ def log(*a):
         sys.stderr.flush()
 
 
+def log_always(*a):
+    """Like log(), but never suppressed by the verbose flag.
+
+    Real faults must be visible in the default launcher, which does not pass
+    --verbose; routine chatter stays behind verbose.
+    """
+    sys.stderr.write("[ccproxy] " + " ".join(str(x) for x in a) + "\n")
+    sys.stderr.flush()
+
+
 def load_config():
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     if os.path.exists(CONFIG_PATH):
@@ -286,6 +296,65 @@ def anthropic_to_openai(req):
         out["reasoning_effort"] = "high" if budget >= 8000 else (
             "medium" if budget >= 2000 else "low")
 
+    out["messages"] = _repair_message_sequence(msgs)
+
+    return out
+
+
+def _repair_message_sequence(msgs):
+    """Fix tool-result ordering the upstream rejects with a bare 400.
+
+    Claude Code legitimately emits a user turn *between* an assistant's
+    tool_use block and its tool_result blocks (AskUserQuestion answers, hook
+    output, interrupt-style input). Flattening that into OpenAI form produces
+
+        assistant(tool_calls) -> user -> tool
+
+    where the ``user`` message separates the assistant from its own tool
+    result. Strict OpenAI-compatible gateways reject that shape, and some
+    (OpenCode Zen's anonymous ``space-bunny-free``) answer only
+    ``invalid_request_error: invalid request`` with no hint about which message
+    is at fault -- so the request just fails intermittently mid-session.
+
+    The fix is to let the tool results follow their assistant directly, keeping
+    whatever the interrupting user turn said. Nothing is dropped: the tool
+    result becomes the assistant's answer and the user's text is prepended to
+    it, which preserves both the tool output and the user's input.
+
+    Returns a new list; the input is left untouched.
+    """
+    out = []
+    i = 0
+    n = len(msgs)
+    while i < n:
+        m = msgs[i]
+        if m.get("role") != "tool":
+            out.append(m)
+            i += 1
+            continue
+
+        # A run of consecutive tool messages starting here.
+        run = []
+        while i < n and msgs[i].get("role") == "tool":
+            run.append(msgs[i])
+            i += 1
+
+        # If the tail of what we emitted so far is a user/system run, it was
+        # pushed in front of these results. Move that whole run back after
+        # them, folding its text into the first result so nothing is lost.
+        tail = []
+        while out and out[-1].get("role") in ("user", "system"):
+            tail.insert(0, out.pop())
+        if tail:
+            text = "\n\n".join(
+                str(x.get("content", "")).strip() for x in tail
+                if str(x.get("content", "")).strip()
+            )
+            if text:
+                first = dict(run[0])
+                first["content"] = text + "\n\n" + str(first.get("content", ""))
+                run[0] = first
+        out.extend(run)
     return out
 
 
@@ -293,6 +362,77 @@ def estimate_tokens(text):
     if not text:
         return 0
     return max(1, int(len(text) / 3.5))
+
+
+# -------------------------------------------------------------- debug helper
+# Upstream 400s are intermittent and the wrapped error text is useless
+# ("invalid request" tells us nothing). When the upstream rejects a request we
+# dump the exact OpenAI body we sent plus a little context to
+# ~/.claude-code-proxy-failures.jsonl so the real cause can be inspected
+# offline instead of guessed at. Purely diagnostic: never touches the reply
+# path, and the file only grows when the upstream actually errors.
+FAIL_LOG_PATH = os.path.join(os.path.expanduser("~"), ".claude-code-proxy-failures.jsonl")
+_FAIL_DUMP_ENABLED = os.environ.get("CCPROXY_DUMP_FAILED", "1") not in ("0", "false", "no")
+_FAIL_DUMP_MAX_BYTES = 256 * 1024
+
+
+def _summarize_oa_body(oa_req):
+    """Field-level overview so a huge body is readable at a glance."""
+    msgs = oa_req.get("messages") or []
+    roles = [m.get("role") for m in msgs]
+    out = {
+        "model": oa_req.get("model"),
+        "stream": oa_req.get("stream"),
+        "max_tokens": oa_req.get("max_tokens"),
+        "reasoning_effort": oa_req.get("reasoning_effort"),
+        "tool_choice": oa_req.get("tool_choice"),
+        "n_tools": len(oa_req.get("tools") or []),
+        "n_messages": len(msgs),
+        "roles": roles,
+        "stop": oa_req.get("stop"),
+        "top_keys": sorted(oa_req.keys()),
+    }
+    # Anything that is not a plain string is a shape risk worth flagging.
+    odd = []
+    for i, m in enumerate(msgs):
+        c = m.get("content")
+        if c is None:
+            odd.append({"i": i, "role": m.get("role"), "issue": "content=null"})
+        elif not isinstance(c, str):
+            odd.append({"i": i, "role": m.get("role"), "issue": "content not a string",
+                        "type": type(c).__name__})
+        if m.get("role") == "tool" and not m.get("tool_call_id"):
+            odd.append({"i": i, "role": "tool", "issue": "missing tool_call_id"})
+    out["anomalies"] = odd
+    return out
+
+
+def _dump_failed_request(oa_req, anthropic_req, status, detail):
+    if not _FAIL_DUMP_ENABLED:
+        return
+    try:
+        rec = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "upstream_status": status,
+            "upstream_error": detail[:600],
+            "anthropic_model": anthropic_req.get("model"),
+            "anthropic_stream": anthropic_req.get("stream"),
+            "anthropic_top_keys": sorted(anthropic_req.keys()),
+            "summary": _summarize_oa_body(oa_req),
+            "openai_body": oa_req,
+        }
+        # Keep the file bounded: truncate the body if it has grown huge.
+        body = json.dumps(rec, ensure_ascii=False)
+        if len(body) > _FAIL_DUMP_MAX_BYTES:
+            rec["openai_body"] = "<omitted: body too large, %d bytes>" % len(
+                json.dumps(oa_req, ensure_ascii=False))
+            rec["summary"]["openai_body_bytes"] = len(
+                json.dumps(oa_req, ensure_ascii=False))
+            body = json.dumps(rec, ensure_ascii=False)
+        with open(FAIL_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(body + "\n")
+    except Exception as e:
+        sys.stderr.write("[ccproxy] failed-request dump skipped: %s\n" % e)
 
 
 # -------------------------------------------------------------- response side
@@ -311,6 +451,11 @@ def upstream_request(oa_req):
     headers = {
         "Content-Type": "application/json",
         "Accept": "text/event-stream" if oa_req.get("stream") else "application/json",
+        # Required. Without it http.client sends "Python-urllib/3.x", and
+        # Cloudflare's WAF answers that with 403 "error code: 1010" when the
+        # request arrives via a proxy egress IP. The refusal surfaces here as an
+        # opaque reset/timeout, which is easy to misread as "upstream down".
+        "User-Agent": "ccproxy/1.0 (+local gateway)",
     }
     key = CONFIG["upstream"].get("api_key") or ""
     if key:
@@ -516,10 +661,55 @@ class StreamTranslator(object):
         return out
 
 
+class QuietThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that treats client disconnects as routine.
+
+    ``socketserver`` prints a full traceback for *any* exception escaping a
+    request thread. A client hanging up mid-request is normal traffic, not a
+    bug, so classify it here: routine disconnects get a one-line note, and
+    anything else is still reported (never silently swallowed).
+    """
+
+    CLIENT_GONE = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, self.CLIENT_GONE):
+            log("client %s disconnected" % (client_address,))
+            return
+        # Timeouts are routine too -- an idle keep-alive socket reaped by the
+        # peer looks exactly like this.
+        if isinstance(exc, TimeoutError):
+            log("client %s timed out" % (client_address,))
+            return
+        # Anything else is a genuine fault: report it loudly, with a marker
+        # that makes it greppable, and still fall back to socketserver's
+        # traceback so nothing is lost.
+        log_always("UNEXPECTED ERROR handling request from %r: %s: %s"
+                   % (client_address, type(exc).__name__, exc))
+        super().handle_error(request, client_address)
+
+
 # -------------------------------------------------------------------- server
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "ccproxy/1.0"
+
+    # -- connection lifecycle ---------------------------------------------
+    # Claude Code opens a socket, may abandon it mid-request (Esc, Ctrl-C,
+    # a tool it no longer needs), and Windows then reports
+    #   ConnectionResetError: [WinError 10054]
+    # from socketserver's worker thread. That is normal client behaviour, not
+    # a gateway fault -- but left unhandled it dumps a full traceback per
+    # occurrence, which buries the log lines that actually matter (real
+    # upstream errors). Swallow it and emit one compact line instead.
+    def handle_one_request(self):
+        try:
+            BaseHTTPRequestHandler.handle_one_request(self)
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            self.close_connection = True
+            log_always("client disconnected before the response was sent "
+                       "(harmless - it cancelled the request)")
 
     def log_message(self, fmt, *args):
         if CONFIG.get("verbose"):
@@ -534,10 +724,26 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+        self._responded = True
 
     def _send_error_anthropic(self, code, kind, message):
         self._send_json(code, {"type": "error",
                                "error": {"type": kind, "message": message}})
+
+    def _send_stream_error(self, kind, message):
+        """Emit an Anthropic-shaped ``error`` event on an open SSE stream.
+
+        A truncated stream closed with a normal ``message_stop`` is the one
+        failure mode clients cannot detect: the turn looks complete, so the
+        client shows a half-written answer and quietly stops instead of
+        retrying. An ``error`` event is the documented way to say "this
+        attempt failed", which is what makes the client retry.
+        """
+        self.wfile.write(b"event: error\n" + json.dumps({
+            "type": "error",
+            "error": {"type": kind, "message": message},
+        }, ensure_ascii=False).encode("utf-8") + b"\n\n")
+        self.wfile.flush()
 
     # -- auth --------------------------------------------------------------
     def _presented_token(self):
@@ -567,7 +773,7 @@ class Handler(BaseHTTPRequestHandler):
             "clients only." % CONFIG_PATH)
 
     def do_GET(self):
-        if self.path.split("?")[0] in ("/health", "/", "/status"):
+        if urlparse(self.path).path in ("/health", "/", "/status"):
             if not self._authorized():
                 self._reject_unauthorized()
                 return
@@ -582,8 +788,98 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send_json(404, {"error": "not found"})
 
+    def _drain_request_body(self):
+        """Read the request body and return it, keeping the socket reusable.
+
+        With HTTP/1.1 keep-alive, any bytes we fail to consume stay in the
+        socket. The next request on that same socket then starts parsing in the
+        middle of the leftover body and the client sees
+        ``code 400, message Bad request syntax ('{"model":...')`` -- which looks
+        like a client bug but is really our leftover. Always call this before
+        replying, even on the error paths.
+
+        Returns the raw bytes (b"" when there was no body).
+        """
+        buf = []
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n > 0:
+            remaining = n
+            while remaining > 0:
+                chunk = self.rfile.read(min(remaining, 65536))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                buf.append(chunk)
+        if (self.headers.get("Transfer-Encoding") or "").lower() == "chunked":
+            # De-chunk so the next request starts on a clean boundary.
+            while True:
+                line = self.rfile.readline(65536).strip()
+                if not line:
+                    break
+                try:
+                    size = int(line.split(b";")[0], 16)
+                except ValueError:
+                    break
+                if size == 0:
+                    self.rfile.readline(65536)
+                    break
+                remaining = size
+                while remaining > 0:
+                    got = self.rfile.read(min(remaining, 65536))
+                    if not got:
+                        break
+                    remaining -= len(got)
+                    buf.append(got)
+                self.rfile.readline(65536)
+        return b"".join(buf)
+
+    # -- token counting ----------------------------------------------------
+    def _count_tokens(self, raw):
+        """Local token estimate for /v1/messages/count_tokens.
+
+        Claude Code calls this before every request to decide when to
+        auto-compact, so it has to return something plausible and, above all,
+        must not 404 (a 404 here strands the request body on a keep-alive
+        socket and corrupts the *next* request). No tokenizer is available
+        offline, so reuse the same char/3.5 heuristic the stream estimator
+        uses; it is only ever used for a threshold comparison.
+        """
+        try:
+            req = json.loads(raw.decode("utf-8")) if raw else {}
+        except Exception:
+            return 0
+        text = _text_of(req.get("system") or "")
+        for m in req.get("messages", []):
+            text += _text_of(m.get("content") or "")
+        for t in req.get("tools", []):
+            text += str(t.get("name", "")) + str(t.get("description", ""))
+            text += json.dumps(t.get("input_schema") or {}, ensure_ascii=False)
+        return estimate_tokens(text)
+
     def do_POST(self):
-        path = self.path.split("?")[0]
+        # Reset per-request reply tracking. The error handler uses this to
+        # tell "client is still waiting for a response" from "we already
+        # answered, nothing more to say" -- getting that backwards either
+        # wedges the client or corrupts an in-flight stream.
+        self._responded = False
+        path = urlparse(self.path).path
+
+        # Always consume the body first: leaving it behind corrupts keep-alive.
+        raw = self._drain_request_body()
+
+        # Claude Code calls this to size its context budget. It is a local
+        # computation -- we never forwarded it upstream -- so answer it here
+        # instead of 404ing and leaving the body on the wire.
+        if path == "/v1/messages/count_tokens":
+            if not self._authorized():
+                self._reject_unauthorized()
+                return
+            self._send_json(200, {"input_tokens": self._count_tokens(raw)})
+            return
+
         if path != "/v1/messages":
             self._send_error_anthropic(404, "not_found_error", "unsupported path " + path)
             return
@@ -593,7 +889,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length) if length else b"{}"
+        raw = raw if raw else (self.rfile.read(length) if length else b"{}")
         try:
             req = json.loads(raw.decode("utf-8"))
         except Exception as e:
@@ -623,13 +919,36 @@ class Handler(BaseHTTPRequestHandler):
             if resp.status != 200:
                 detail = resp.read().decode("utf-8", "replace")[:800]
                 log("upstream", resp.status, detail)
+                _dump_failed_request(oa_req, req, resp.status, detail)
                 kind = "authentication_error" if resp.status in (401, 403) else "api_error"
                 self._send_error_anthropic(resp.status, kind,
                                            "upstream %s: %s" % (resp.status, detail))
                 return
 
             if not want_stream:
-                data = json.loads(resp.read().decode("utf-8"))
+                # A non-streaming upstream can still die mid-body: it may
+                # promise a Content-Length and then reset the connection.
+                # ``resp.read()`` then blocks forever, the client never gets
+                # a reply and never sees an error, so the whole session
+                # stalls with no way to recover. Bound the read by the
+                # declared length and fail loudly instead of hanging.
+                try:
+                    raw_body = resp.read()
+                except Exception as e:
+                    log_always("upstream body read failed mid-flight: %s: %s"
+                               % (type(e).__name__, e))
+                    self._send_error_anthropic(
+                        502, "api_error",
+                        "upstream response was truncated: %s" % e)
+                    return
+                try:
+                    data = json.loads(raw_body.decode("utf-8"))
+                except Exception as e:
+                    log_always("upstream sent unparseable body: %s" % e)
+                    self._send_error_anthropic(
+                        502, "api_error",
+                        "upstream sent an invalid body: %s" % e)
+                    return
                 self._send_json(200, openai_to_anthropic(data, model_for_reply))
                 return
 
@@ -640,6 +959,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
+            self._responded = True
 
             tr = StreamTranslator(model_for_reply, prompt_chars)
             self.wfile.write(tr.start())
@@ -664,18 +984,34 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(tr.finish())
             self.wfile.flush()
         except Exception as e:
-            log("stream error:", e)
-            # Never leave the client hanging: try to close the stream cleanly.
+            log_always("stream error: %s: %s" % (type(e).__name__, e))
+            _dump_failed_request(oa_req, req, 599, "%s: %s" % (type(e).__name__, e))
+            # Never leave the client hanging. But do NOT close the stream with
+            # a normal message_stop: that makes a truncated answer look
+            # complete, so the client keeps it and silently stops instead of
+            # retrying. Tell the client the attempt failed.
             try:
                 if want_stream and getattr(self, "wfile", None):
-                    tr = locals().get("tr")
-                    if tr is not None:
-                        self.wfile.write(tr.finish())
-                    else:
-                        self.wfile.write(StreamTranslator(model_for_reply, 0).finish())
-                    self.wfile.flush()
+                    self._send_stream_error(
+                        "api_error",
+                        "upstream stream failed after %d characters: %s"
+                        % (getattr(locals().get("tr"), "out_chars", 0), e))
+                elif not getattr(self, "_responded", False):
+                    # Nothing has been written yet, so the client is still
+                    # waiting for a response that will never come unless we
+                    # send one. Sending nothing is what wedges the session.
+                    self._send_error_anthropic(
+                        502, "api_error",
+                        "upstream request failed: %s: %s"
+                        % (type(e).__name__, e))
             except Exception:
+                # The client is already gone; nothing left to tell it.
                 pass
+            finally:
+                # Whatever happened, do not leave the socket half-open: a
+                # keep-alive connection with no response stalls the client
+                # until its own timeout expires.
+                self.close_connection = True
         finally:
             try:
                 if resp:
@@ -717,7 +1053,7 @@ def main():
     ensure_client_token(CONFIG)
 
     host, port = CONFIG["host"], CONFIG["port"]
-    srv = ThreadingHTTPServer((host, port), Handler)
+    srv = QuietThreadingHTTPServer((host, port), Handler)
     srv.daemon_threads = True
     sys.stderr.write(
         "[ccproxy] listening on http://%s:%d  ->  %s (%s)\n"

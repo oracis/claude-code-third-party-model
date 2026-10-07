@@ -2,12 +2,12 @@
 name: claude-code-third-party-model
 slug: claude-code-third-party-model
 displayName: Claude Code 接入第三方模型
-version: 1.1.3
+version: 1.2.0
 license: MIT
 category: dev-programming
 subCategories: [dev-script, dev-bug-fix]
 platforms: [WorkBuddy, Claude Code, Codex]
-description: 把本地 Claude Code 接到第三方端点——分两路：① 原生 Anthropic 兼容端点（DeepSeek / Kimi / GLM）直接改 ANTHROPIC_BASE_URL；② 只有 OpenAI 兼容端点的模型（Space Bunny / 各类 stealth 模型）必须加本地网关做 Anthropic→OpenAI 协议转换 —— **用自建零依赖 `ccproxy.py`**（claude-code-router 2.1.1 的流式 SSE 输出畸形、已弃用）。并诊断「模型名写对了却不生效」「配置被别处覆盖」「未知模型告警」「连第三方后变慢」「API Error: The response stream was malformed」五类问题。当用户说「给 claude code 配置 deepseek/别的模型」「claude code 换模型不生效」「ANTHROPIC_BASE_URL 怎么设」「unrecognized_model 警告」「claude code 连 deepseek 很慢」「effort 设多少」「要不要开 max」「把 OpenRouter 上的某某模型接进 claude code」「space bunny 怎么接」「响应流畸形/回答不完整/流式报错」时使用。也覆盖**多 profile 一键切换**（`ccswitch.py`：「切 deepseek」「切 space bunny」「现在什么模型」）。含模型 ID 实测法、配置优先级判定法、Windows 注册表排查、用本地中继抓真实请求做性能归因、claude-code-router 的 config-router.json 文件名陷阱、自建网关的规范 SSE 生成法与客户端令牌鉴权。也覆盖**把模型配进 WorkBuddy 客户端**（`~/.workbuddy/models.json`）——含「`apiKey` 留空会被回落成平台 token 导致上游 401 / 错误码 3001」这一最易踩坑的诊断与修法。
+description: 把本地 Claude Code 接到第三方端点——分两路：① 原生 Anthropic 兼容端点（DeepSeek / Kimi / GLM）直接改 ANTHROPIC_BASE_URL；② 只有 OpenAI 兼容端点的模型（Space Bunny / 各类 stealth 模型）必须加本地网关做 Anthropic→OpenAI 协议转换 —— **用自建零依赖 `ccproxy.py`**（claude-code-router 2.1.1 的流式 SSE 输出畸形、已弃用）。并诊断「模型名写对了却不生效」「配置被别处覆盖」「未知模型告警」「连第三方后变慢」「API Error: The response stream was malformed」五类问题。当用户说「给 claude code 配置 deepseek/别的模型」「claude code 换模型不生效」「ANTHROPIC_BASE_URL 怎么设」「unrecognized_model 警告」「claude code 连 deepseek 很慢」「effort 设多少」「要不要开 max」「把 OpenRouter 上的某某模型接进 claude code」「space bunny 怎么接」「响应流畸形/回答不完整/流式报错」「网关 502 / WinError 10054 刷屏」「error code 1010」「It may not exist or you may not have access to it」「卡住不动」时使用。也覆盖**多 profile 一键切换**（`ccswitch.py`：「切 deepseek」「切 space bunny」「现在什么模型」）。含模型 ID 实测法、配置优先级判定法、Windows 注册表排查、用本地中继抓真实请求做性能归因、claude-code-router 的 config-router.json 文件名陷阱、自建网关的规范 SSE 生成法与客户端令牌鉴权。也覆盖**把模型配进 WorkBuddy 客户端**（`~/.workbuddy/models.json`）——含「`apiKey` 留空会被回落成平台 token 导致上游 401 / 错误码 3001」这一最易踩坑的诊断与修法。
 agent_created: true
 ---
 
@@ -15,7 +15,7 @@ agent_created: true
 
 > 开源仓库：<https://github.com/oracis/claude-code-third-party-model>
 > 本技能自带两个**零依赖**脚本（在 `scripts/` 目录下）：
-> **`ccproxy.py`** —— Anthropic ↔ OpenAI 协议转换网关（纯标准库，约 640 行）；
+> **`ccproxy.py`** —— Anthropic ↔ OpenAI 协议转换网关（纯标准库，约 1080 行）；
 > **`ccswitch.py`** —— 多 profile 一键切换 + 网关启停协调（跨平台，约 430 行）。
 > 另有 `examples/profiles/` 提供开箱可用的 `settings.json` 模板。
 
@@ -446,6 +446,419 @@ print(re.search(r'"canonicalModel"\s*:\s*"([^"]*)"', p.stdout).group(1))
 ---
 
 # 第四部分：Windows 环境注意点
+
+## `ConnectionResetError: [WinError 10054]` 满屏 traceback（2026-10-06 实测根治）
+
+**症状**：网关窗口刷出整块 traceback，源头是 `socketserver.py` 的
+`process_request_thread`，栈底是 `handle_one_request` → `rfile.readline` →
+`socket.recv_into`：
+
+```
+Exception occurred during processing of request from ('127.0.0.1', 10511)
+  File "socketserver.py", line 766, in __init__ ... self.handle()
+  File "http\server.py", line 415, in handle_one_request
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+```
+
+**这本身不是故障** —— 客户端中途放弃请求就会这样。但**必须处理**，因为：
+
+1. 一次中断刷一整块 traceback，几十行起步；
+2. 它会把真正该看的日志（上游 400/5xx、`UNEXPECTED ERROR`）**淹没**；
+3. 看起来像网关崩了，实际连接是好的。
+
+**常见触发**（都是正常流量，不是 bug）：用户按 Esc / Ctrl+C 取消、
+Claude Code 换掉不再需要的请求、keep-alive 空闲 socket 被对端回收、
+流式响应读到一半客户端就关窗。
+
+**修法（`ccproxy.py`，两处 + 一个常量）**：
+
+```python
+CLIENT_GONE = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
+```
+
+1. `Handler.handle_one_request` 覆盖：包住基类调用，只捕获上面三个异常 →
+   置 `close_connection = True`，打**一行**说明后正常返回。
+2. 新增 `QuietThreadingHTTPServer(ThreadingHTTPServer)`，覆写 `handle_error`：
+   - `CLIENT_GONE` → 一行日志（路由到 `log()`，可被 verbose 关闭）
+   - `TimeoutError` → 一行日志（空闲 keep-alive 被回收也是这个形态）
+   - **其他异常 → `log_always()` 打出 `UNEXPECTED ERROR handling request from ...`
+     再调 `super().handle_error()` 保留原traceback**。
+     绝不能静默吞掉真故障。
+3. `main()` 里改用 `srv = QuietThreadingHTTPServer(...)`。
+4. 新增 `log_always()`：不受 `--verbose` 影响的输出通道。
+   桌面启动器默认**不加** `--verbose`，真实错误若走 `log()` 就永远看不见 ——
+   这是排查问题时最容易踩的空。
+
+`WinError 10053`（本地软件中止了已建立的连接，中文系统上对应 `ECONNABORTED`）
+与 10054 同类，也要一并捕获；流式写回时它已被 `do_POST` 的 `except` 收尾。
+
+**验证方法**：不能只测正常请求，要**主动制造中断**：
+
+```python
+# 1) 发一半 body 就 close
+s.sendall(headers + body[:len(body)//2]); s.close()
+# 2) 连上就 close，一个字节都不发
+s.close()
+# 3) 流式响应读一半就 close
+r.read(120); c.close()
+```
+
+每种打 3 次，然后检查网关 stderr：**零 traceback**，且每个请求恰好一行日志。
+实测 9 次中断 → 9 行简洁日志，功能回归（keep-alive 10/10、中断场景 4/4）全通过。
+
+## `stream error 10054` 之后再无请求 → 会话静默卡死（2026-10-06 实测根治）
+
+**症状**（与上一节的 traceback 刷屏**完全不同**，别混淆）：
+
+```
+[ccproxy] stream error: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+[ccproxy] client disconnected before the response was sent (harmless - it cancelled the request)
+[ccproxy] "GET /health HTTP/1.1" 200 -
+<此后日志静默，客户端再也没有新请求发出>
+```
+
+`/health` 还能 200，说明**监听线程活着**；但真实推理请求一个都不再出现，
+整个会话像卡死。**这不是客户端问题，是网关的 bug。**
+
+**根因（两条独立缺陷，缺一不可）**：
+
+1. **非流式路径的 `resp.read()` 会永久阻塞**。上游先回
+   `Content-Length: N` 再发 RST（`SO_LINGER{1,0}`），`http.client` 会**一直等
+   满 N 字节**，RST 只让 `recv` 抛一次、被重试后继续等 → 线程永久卡住，
+   客户端既收不到响应也等不到连接关闭（实测 `http=000`，6/6 全挂）。
+2. **流式路径用「假装成功」掩盖截断**。RST 后旧代码调 `tr.finish()`，
+   照发 `message_delta(end_turn)` + `message_stop`。客户端看到的是
+   **一个语法完全合法、内容却被截断的"完整"回答**，于是接受它、不重试、
+   不再发新请求 —— 表现就是「然后就没有新请求被发出来了」。
+
+**为什么"重启就好"骗人**：`ThreadingHTTPServer` 每请求一线程，卡死的线程
+不会传染，**流式请求仍能 200**（实测 RST 后 stream 200 / health 200，
+只有 `stream:false` 挂死）。所以看起来"时好时坏"，实则取决于
+Claude Code 该轮是否发了非流式请求。
+
+**修法（`ccproxy.py` 三处）**：
+
+```python
+def do_POST(self):
+    self._responded = False      # ① 区分"还没回复"和"已回复"
+    ...
+    if not want_stream:
+        try:
+            raw_body = resp.read()
+        except Exception as e:
+            log_always("upstream body read failed mid-flight: %s: %s" % (...))
+            self._send_error_anthropic(502, "api_error",
+                                       "upstream response was truncated: %s" % e)
+            return                                  # ② 绝不静默挂死
+    ...
+    except Exception as e:
+        log_always("stream error: %s: %s" % (type(e).__name__, e))
+        if want_stream:
+            self._send_stream_error("api_error", ...)   # ③ error 事件，不补 message_stop
+        elif not self._responded:
+            self._send_error_anthropic(502, "api_error", ...)
+    finally:
+        self.close_connection = True                   # 不留半开 keep-alive
+```
+
+**③ 是关键**：流式失败必须发 `event: error`（Anthropic 规范里表示
+"这次尝试失败"），**不能补 `message_stop`**。补了等于告诉客户端
+"这条回答完整结束了"，客户端就不会重试。
+
+**验证方法（必须造 RST，不能只测正常请求）**：
+写一个假上游，`SO_LINGER{1,0}` 后 `close()` 制造真 RST：
+
+```python
+self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+self.connection.close()
+```
+
+非流式要**谎报 Content-Length**（`len(body)+50` 但只发 `len(body)`）
+才能复现永久阻塞。修复前：6/6 `http=000` 挂死；修复后：6/6 在 **44ms** 内
+返回 502，流式路径发出 `event: error` 且带已输出字符数。
+
+**排查这条坑时踩到的两个环境陷阱（都不是代码问题，别误判成 bug）**：
+
+- **`nohup ... &` 启动的进程会随工具 shell 退出被回收**。日志停在最后一行、
+  端口无监听、`/health` 返回 502 —— 看起来像"网关又挂了"。
+  工具里必须用后台任务方式启动（`run_in_background`）才活得久。
+- ~~上游 `User-Agent` 不是断流原因~~。实测无 UA / 浏览器 UA / 诚实 UA
+  各 3 次全部干净收尾（9/9），**不要**在这上面浪费时间。
+  ⚠️ **2026-10-07 更正**：这条只在**直连**时成立。**经代理出口时 UA 恰恰是致命项** ——
+  见下节「Cloudflare 1010」，当时正是这条旧结论让人差点改错方向。
+
+## 请求行带绝对 URL → 404（2026-10-07 实测根治）
+
+**症状**：网关日志里请求行长这样，**混在正常请求中间**：
+
+```
+[ccproxy] "POST /v1/messages?beta=true HTTP/1.1" 200 -
+[ccproxy] "POST http://127.0.0.1:3457/v1/messages?beta=true HTTP/1.1" 404 -
+[ccproxy] "POST http://127.0.0.1:3457/v1/messages?beta=true HTTP/1.1" 404 -
+```
+
+Claude Code 侧表现为**跑到一半报**：
+`There's an issue with the selected model (space-bunny[1m]). It may not exist
+or you may not have access to it. Run --model to pick a different model.`
+—— 这句提示**极具误导性**：模型明明是好的，上下文窗口也确实是 1M。
+
+**根因**：经代理（PROXY / TUN）时，客户端发给代理的是**绝对形式**的请求目标
+（RFC 7230 §5.3.2 允许代理把绝对 URI 发给下一跳）。网关原来用
+`self.path.split("?")[0]` 取路径，于是得到
+`http://127.0.0.1:3457/v1/messages` —— 带 scheme 和 host，
+跟 `/v1/messages` 比对不上 → **404**。
+
+**修法（两处，`do_POST` 与 `do_GET` 各一个）**：
+
+```python
+from urllib.parse import urlparse      # 确认已导入
+
+# do_POST
+path = urlparse(self.path).path         # 原：self.path.split("?")[0]
+# do_GET
+if urlparse(self.path).path in ("/health", "/", "/status"):
+```
+
+`urlparse().path` 对两种形式都只返回路径部分，是标准解法。
+
+**验证（用裸 socket 发绝对 URL，别只测相对路径）**：
+
+```python
+s = socket.create_connection(("127.0.0.1", 3457), timeout=60)
+req = (b"POST http://127.0.0.1:3457/v1/messages?beta=true HTTP/1.1\r\n"
+       b"Host: 127.0.0.1:3457\r\nx-api-key: " + tok.encode() +
+       b"\r\ncontent-type: application/json\r\nContent-Length: " +
+       str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
+```
+
+实测修复后：相对路径 200、绝对 URL 200、绝对 URL 的 `count_tokens` 200，
+真实 `claude.exe -p` 带 Bash 工具跑 **6 轮 `is_error=false`**。
+
+**判据：日志里同时出现 `/path` 和 `http://host/path` 两种形式 → 就是这个坑。**
+`http.client` 不会把绝对 URL 发给你，所以这类问题**只在本机直连的测试里复现不出来**，
+必须真的经代理跑一次多轮工具调用才会暴露。
+
+## `error code: 1010`：`User-Agent` 被 Cloudflare WAF 拦（2026-10-07 实测根治）
+
+**症状**：网关窗口刷 502 / `WinError 10054`，failures jsonl 里清一色
+`upstream_status 599` + `ConnectionResetError`，**看起来像"上游挂了/网络不通"**。
+但模型其实好好挂着，配置一个字都没错。
+
+**根因**：`ccproxy.py` 原来只发 `Content-Type` + `Accept`，**不发 User-Agent**。
+Python `http.client` 会自动补 `Python-urllib/3.x`，Cloudflare 的 WAF 认这个UA →
+回 `403 error code: 1010`。**且仅在经代理出口 IP 时触发，直连不触发。**
+
+**决定性 A/B 表（各2 次，6/6 稳定复现）**：
+
+| 链路 | User-Agent | 结果 |
+|---|---|---|
+| 经代理 | Python 默认（不设） | **403 `error code: 1010`** |
+| 经代理 | `ccproxy/1.0 (+local gateway)` | 200, 1.9s |
+| 经代理 | 浏览器 UA | 200, 1.6s |
+| **直连** | Python 默认 | **200 ✅** |
+| 直连 | 诚实 UA | 200, 2.0s |
+
+**修法（`ccproxy.py` 的 `_open_upstream()`，一行）**：
+
+```python
+headers = {
+    "Content-Type": "application/json",
+    "Accept": "text/event-stream" if oa_req.get("stream") else "application/json",
+    # 不设 UA 会被 WAF 403 1010，且表象像"上游挂了"
+    "User-Agent": "ccproxy/1.0 (+local gateway)",
+}
+```
+
+诚实 UA 就够，**不必伪装浏览器**。顺带：直连时带 UA 反而快 6 倍
+（12.5s → 2.0s，慢的那次是 WAF 排队）。
+
+### ⚠️ 判据顺序：403/4xx 错误码 > 超时
+
+**这才是本次最贵的教训**：第一轮我看到 `http=000` / 15s 超时 / `WinError 10054`
+就断定"Zen 上游对本机不可达"，还据此建议改网关的代理策略 —— **方向完全错了**。
+超时是最不可靠的信号，因为它**能由"拒绝"伪装出来**（WAF 断连 / RST / 静默丢弃）。
+
+→ **见到超时应先设法拿到一个状态码**（直连绕过代理打一次、看 `failures` 里有没有
+`upstream_status`、或换 `curl -v` 看 TLS 握手在哪一步断）。
+**`upstream_status 599` 是网关自己的合成码，不是上游返回的真实码** ——
+它只说明"连接没能完成"，不能推出"上游不可用"。
+真实错误码出现了（`403` / `401` / `400`）才是有信息量的。
+
+### 为什么模型清单能 200 而推理 403
+
+`GET /zen/v1/models` 是公开只读端点，WAF 放行；`POST /zen/v1/chat/completions`
+才走 WAF 规则。**所以"能拉到模型清单"不能证明"推理能通"** ——
+别用它当健康判据（`/health` 只验网关自己，不打上游，同样不能证明上游可用）。
+
+**教训**：`log_always` 打出的 `stream error` 不是"无害噪音"，它是
+**上游链路已经断了**的唯一信号。下一条请求不来时，先查
+`netstat -ano | findstr :3457` 看监听是否还在 —— 监听在但请求不来，
+才是本节这个 bug。
+
+**别把工具的进程回收当成崩溃**：用工具后台任务启动的长驻服务，会在
+任务生命周期结束时收到 `status: failed` 通知，但那是**外壳被回收**，
+不等于进程死了。以 `netstat` + `/health` 为准 —— 实测出现过
+通知报 failed、PID 已从 12040 变成 2400（被重新拉起）、端口仍在监听、
+流式与非流式请求依然 200 的情况。**判定标准只有一个：端口是否 LISTENING。**
+
+**判据：看到 socketserver 的 traceback 先别查网关逻辑** ——
+先确认异常类型。`CLIENT_GONE` / `TimeoutError` 是客户端行为，与网关无关；
+其它类型才顺着 `log_always` 标记去查。
+
+## `count_tokens` 404 连环污染：`Bad request syntax ('{"model"...` （2026-10-06 实测根治）
+
+**症状**（日志里连着出现，顺序固定）：
+
+```
+"POST /v1/messages?beta=true" 200 -
+"POST /v1/messages/count_tokens?beta=true" 404 -
+code 400, message Bad request syntax ('{"model":"space-bunny","messages":[...}],"tools":[]}POST /v1/messages?beta=true HTTP/1.1')
+"POST /v1/messages?beta=true" 200 -
+```
+
+那个 `code 400 ... Bad request syntax` **不是上游报错**，是 `BaseHTTPRequestHandler`
+自己打出来的 —— 注意它在消息里**重复了整个请求体并紧跟下一条请求行**，这是决定性特征。
+看起来像客户端发了畸形请求、或像 body 里带了奇怪字符，实际都不是。
+
+**根因（两个叠加）**：
+
+1. **缺 `/v1/messages/count_tokens` 端点**。Claude Code 每次请求前都调它算上下文预算，
+   而 `do_POST` 只认 `/v1/messages`，其它路径直接 404。
+2. **致命的那一半**：404 是**在读取请求体之前**返回的。HTTP/1.1 keep-alive 下，
+   客户端已经把几十 KB 的 body 写进 socket 了，我们没读走 →
+   下一个请求复用同一 socket 时，解析器从**残留 body 中间**开始读 →
+   把 body 的 JSON 当成请求行 → `Bad request syntax`。
+   **body 越大越容易触发**（本例 body 是整个 page.tsx）。
+
+→ **判据：`BaseHTTPRequestHandler` 里任何 return 之前，都必须先把 body 读干净。**
+
+**修法**（`ccproxy.py`，两处）：
+
+- 新增 `_drain_request_body()`：按 64KB 分块读干净 `Content-Length`，
+  再处理 chunked（de-chunk 到结束块并吃掉其后的 CRLF），
+  **返回 body 字节**（供后续复用，别读第二次）。
+- `do_POST` **第一行**就 `raw = self._drain_request_body()`，
+  然后 404 / 401 / bad json 等所有早退分支都在 body 已读走之后才返回。
+- 实现 `/v1/messages/count_tokens`：本地估算即可（复用 `estimate_tokens`
+  的 `字符数/3.5`），返回 `{"input_tokens": N}`。它本来就只是给 auto-compact
+  做阈值比较，不需要真 tokenizer。**别再 404** —— 404 本身就是 bug 的来源。
+- 401 分支也要排空：未授权请求同样带 body。
+
+**三个连带坑**：
+
+1. `_drain_request_body` **必须返回 body**。若它丢弃，调用方还得再读一次
+   `self.rfile.read()` → 拿到空 → `_count_tokens` 恒返回 0。
+2. 分块读取要用 `min(remaining, 65536)` 循环，别一次 `read(n)`；
+   大 body（实测 300KB）容易短读。
+3. chunked 传输要**读到 size=0 的结束块**并吃掉其后的 CRLF，否则边界仍不对齐。
+
+**验证方法（必须测 keep-alive，不能只测单请求）**：
+
+用一个 `http.client.HTTPConnection` 复用同一连接，先打 `count_tokens`，
+再在同一连接上打 `/v1/messages`，第二次必须是 200。
+
+实测覆盖：count_tokens→messages 同连接 200；未知路径 404→messages 同连接 200；
+同一连接交替 10 次 10/10 全 200；401 路径后同连接 200；300KB body 200 且
+`message_stop` 恰好 1 次；真实 `claude.exe` 多轮全 200。
+
+> 顺带说明：日志里 `401` 出现在 count_tokens 上是**正常**的 —— 那是本节测试
+> 故意不带 token 打的，目的是确认 401 路径也不会污染连接。
+
+## 间歇性 upstream 400 `invalid request`：tool_result 前插了 user 消息（2026-10-06 实测根治）
+
+**症状**：用 ccproxy + Space Bunny 时，会话中途**间歇性** 400，日志只有一句
+`upstream 400 {"error":{"type":"invalid_request_error","message":"... [invalid_request_error] invalid request"}}`，
+**完全不说哪条消息有问题**。有的请求 200、下一条就 400，CC 会自动重试所以有时能过去，
+表现为"卡一下"。看起来像限流、像内容太长、像模型名错，**都不是**。
+
+**根因**：Claude Code 会在 assistant 的 `tool_use` 和它的 `tool_result` **之间**
+插入 user 消息（`AskUserQuestion` 的回答、hook 输出、中断式输入）。转成 OpenAI 格式后
+就变成：
+
+```
+assistant(tool_calls) -> user -> tool      ← tool 脱离了它的 assistant
+```
+
+严格的 OpenAI 兼容网关拒绝这个形状。实测确认：
+- `M[:38]`（结尾是 user）→ **200**
+- `M[:39]`（结尾是 tool）→ **400**
+- 把那条 tool 的 `content` 换成完全合法的 user 消息 → **200**
+- 连 `tool_call_id` 是假值的孤儿 tool 消息 → **400**
+- `max_tokens` 从 32000 降到 2048 → 仍 **400**（排除 token 预算）
+
+→ **判据：tool 消息前面紧邻的必须是声明它的那个 assistant（含 tool_calls），
+中间不能夹 user/system。**
+
+**修法**（`ccproxy.py` 的 `_repair_message_sequence`，已内置）：把夹在
+assistant 与其 tool 结果之间的 user/system 消息**移到 tool 结果之后**，
+并把它们的文本**前置合并进第一个 tool 结果的 content** —— 不丢任何信息。
+函数返回新列表，单趟扫描，幂等，不修改入参。
+
+### 排查这类"上游说 valid 但没说是哪个"的 400 的通用手法
+
+1. **先抓真实请求体**：网关在 upstream != 200 时把 `oa_req` 落到
+   `~/.claude-code-proxy-failures.jsonl`（含 summary + 完整 body，>256KB 自动截断）。
+   设为 `CCPROXY_DUMP_FAILED=0` 可关闭。**没有这步就只能猜。**
+2. **前缀扫描找临界点**：`for k in range(30,41): post(M[:k])` —— 精确定位
+   「加哪一条开始 400」。本例 `first 38 -> 200 / first 39 -> 400`，一步锁定。
+3. **对照实验排除干扰**：同一条消息换 role / 换 content / 改 max_tokens / 删一半，
+   看 400 是否消失。别只试一个变量。
+4. **别被"1 个字符也 400"误导**：单独发一条 `{"role":"system","content":"x"}` 也 400，
+   看起来像"system 消息不被支持"，其实是**该消息后面没有 user**。
+   → 任何"最小用例也失败"都要怀疑**结构约束**，不要怀疑内容。
+
+### 修完必须做的回归
+
+- 离线单测 13 个用例覆盖：正常配对、单/多 user 插入、user+system 插入、
+  多 tool 中途插入、连续 3 次插入、空 tool content、幂等性、入参不被修改。
+  **断言三件事**：无 `user/system -> tool` 相邻、无内容丢失、无孤儿 `tool_call_id`。
+- 用**抓到的真实失败 body** 回放 → 必须 200。
+- 真实 `claude.exe -p` 多轮带工具 → 失败日志必须为空。
+
+## Windows `.cmd` 启动器：编码与换行是头号坑（2026-10-05 实测）
+
+给用户写 Windows 批处理启动器，**必须 GBK 编码 + CRLF 换行**，否则整段脚本会被
+cmd.exe 拆成碎片：
+
+| 症状 | 根因 |
+|---|---|
+| `'nny' is not recognized...` | 文件是 UTF-8 + **LF**，cmd.exe 把 `Bunny` 之类行截断（LF 不算行尾） |
+| `'--verbose' is not recognized...` | 同上，某行被拆成独立命令行 |
+| `'任意键关闭窗口。' is not...` | 同上 + GBK 解码 UTF-8 产生乱码 |
+| `The system cannot find the path specified.` | 上一行的乱码把路径写坏了 |
+
+**正确写法**：用 Python 显式控制编码，别用 Write 工具直接写（默认 UTF-8 + LF）：
+
+```python
+open(path, "wb").write(("\r\n".join(lines) + "\r\n").encode("gbk"))
+```
+
+中文提示语配合 `chcp 936`；若必须 UTF-8 中文，则 `chcp 65001` **且**文件存 UTF-8 + CRLF。
+中文文件名本身没问题，坏的是**内容编码**。
+
+### 批处理里三个必须避开的坑
+
+1. **`timeout` 会被 Git Bash / MSYS 的 coreutils 抢占** → 报
+   `timeout: invalid time interval '/t'`。延时改用 `ping -n 2 127.0.0.1 >nul`。
+2. **用了 `!VAR!` 就必须 `setlocal EnableDelayedExpansion`**，否则取到空值，
+   清理/条件分支静默失效（`if defined OLD` 那套同理）。
+3. **`for /f` 取 netstat 的 PID**：`netstat -ano | findstr LISTENING | findstr ":PORT "`
+   取第 5 个 token；注意排除 `TIME_WAIT`（它不是 LISTENING）。
+
+### 端口占用的静默卡死
+
+端口已被另一个网关实例占用时，`ccproxy.py` **不会报错退出，而是继续挂着**，
+表现为「双击启动器 → 窗口有输出 → 但 claude 连不上」。启动器必须先清理：
+
+```
+for /f "tokens=5" %%P in ('netstat -ano ^| findstr LISTENING ^| findstr ":3457 "') do set "OLD=%%P"
+if defined OLD taskkill /F /PID !OLD!
+# kill 后必须复检一次，仍占用则报错退出，别让用户干等
+```
+
+`ccswitch.py` 自带的网关拉起有同样问题（见上「本机坑」表）。
+**验证启动器时务必先手动清空端口**，否则测的是「旧实例还活着」，
+会误判成新启动器正常。
 
 ## 其它本机坑
 
