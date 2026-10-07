@@ -2,12 +2,12 @@
 name: claude-code-third-party-model
 slug: claude-code-third-party-model
 displayName: Claude Code 接入第三方模型
-version: 1.2.0
+version: 1.3.0
 license: MIT
 category: dev-programming
 subCategories: [dev-script, dev-bug-fix]
 platforms: [WorkBuddy, Claude Code, Codex]
-description: 把本地 Claude Code 接到第三方端点——分两路：① 原生 Anthropic 兼容端点（DeepSeek / Kimi / GLM）直接改 ANTHROPIC_BASE_URL；② 只有 OpenAI 兼容端点的模型（Space Bunny / 各类 stealth 模型）必须加本地网关做 Anthropic→OpenAI 协议转换 —— **用自建零依赖 `ccproxy.py`**（claude-code-router 2.1.1 的流式 SSE 输出畸形、已弃用）。并诊断「模型名写对了却不生效」「配置被别处覆盖」「未知模型告警」「连第三方后变慢」「API Error: The response stream was malformed」五类问题。当用户说「给 claude code 配置 deepseek/别的模型」「claude code 换模型不生效」「ANTHROPIC_BASE_URL 怎么设」「unrecognized_model 警告」「claude code 连 deepseek 很慢」「effort 设多少」「要不要开 max」「把 OpenRouter 上的某某模型接进 claude code」「space bunny 怎么接」「响应流畸形/回答不完整/流式报错」「网关 502 / WinError 10054 刷屏」「error code 1010」「It may not exist or you may not have access to it」「卡住不动」时使用。也覆盖**多 profile 一键切换**（`ccswitch.py`：「切 deepseek」「切 space bunny」「现在什么模型」）。含模型 ID 实测法、配置优先级判定法、Windows 注册表排查、用本地中继抓真实请求做性能归因、claude-code-router 的 config-router.json 文件名陷阱、自建网关的规范 SSE 生成法与客户端令牌鉴权。也覆盖**把模型配进 WorkBuddy 客户端**（`~/.workbuddy/models.json`）——含「`apiKey` 留空会被回落成平台 token 导致上游 401 / 错误码 3001」这一最易踩坑的诊断与修法。
+description: 把本地 Claude Code 接到第三方端点——分两路：① 原生 Anthropic 兼容端点（DeepSeek / Kimi / GLM）直接改 ANTHROPIC_BASE_URL；② 只有 OpenAI 兼容端点的模型（Space Bunny / 各类 stealth 模型）必须加本地网关做 Anthropic→OpenAI 协议转换 —— **用自建零依赖 `ccproxy.py`**（claude-code-router 2.1.1 的流式 SSE 输出畸形、已弃用）。并诊断「模型名写对了却不生效」「配置被别处覆盖」「未知模型告警」「连第三方后变慢」「API Error: The response stream was malformed」五类问题。当用户说「给 claude code 配置 deepseek/别的模型」「claude code 换模型不生效」「ANTHROPIC_BASE_URL 怎么设」「unrecognized_model 警告」「claude code 连 deepseek 很慢」「effort 设多少」「要不要开 max」「把 OpenRouter 上的某某模型接进 claude code」「space bunny 怎么接」「响应流畸形/回答不完整/流式报错」「网关 502 / WinError 10054 刷屏」「error code 1010」「It may not exist or you may not have access to it」「卡住不动」「Bash 工具卡住」「auto mode cannot determine the safety of Bash」「大 payload 变慢」时使用。也覆盖**多 profile 一键切换**（`ccswitch.py`：「切 deepseek」「切 space bunny」「现在什么模型」）。含模型 ID 实测法、配置优先级判定法、Windows 注册表排查、用本地中继抓真实请求做性能归因、claude-code-router 的 config-router.json 文件名陷阱、自建网关的规范 SSE 生成法与客户端令牌鉴权。也覆盖**把模型配进 WorkBuddy 客户端**（`~/.workbuddy/models.json`）——含「`apiKey` 留空会被回落成平台 token 导致上游 401 / 错误码 3001」这一最易踩坑的诊断与修法。
 agent_created: true
 ---
 
@@ -15,7 +15,7 @@ agent_created: true
 
 > 开源仓库：<https://github.com/oracis/claude-code-third-party-model>
 > 本技能自带两个**零依赖**脚本（在 `scripts/` 目录下）：
-> **`ccproxy.py`** —— Anthropic ↔ OpenAI 协议转换网关（纯标准库，约 1080 行）；
+> **`ccproxy.py`** —— Anthropic ↔ OpenAI 协议转换网关（纯标准库，约 1240 行）；
 > **`ccswitch.py`** —— 多 profile 一键切换 + 网关启停协调（跨平台，约 430 行）。
 > 另有 `examples/profiles/` 提供开箱可用的 `settings.json` 模板。
 
@@ -1341,3 +1341,93 @@ curl -sN http://127.0.0.1:3457/v1/messages \
   （CC 2.1.278：`package.json` 的 `bin` = `bin/claude.exe`，**不再有 `cli.js`**，别再按老路径找）。
 - 该 exe 体积约 237MB，首次 `ls` 会略慢，正常。
 
+
+## 大 payload 才是真凶（2026-10-07 实测，v1.3.0）
+
+前面两节修的是「持续性故障」。这一节是**残余的间歇故障**，机制完全不同。
+
+### 决定性数据
+
+同一网关、同一时刻、同一 payload，只改变一个变量：
+
+| 场景 | 结果 | 耗时 |
+|---|---|---|
+| 16B token 小请求（顺序·直连） | 10/10 | **4.0s** |
+| **183KB 真实 payload**（顺序·非流式） | 3/3 | **34-47s** |
+| 183KB（顺序·流式） | 2/2 | 24-36s |
+| 183KB（**并发 4**·流式） | 4/4 | 35-37s |
+| 183KB（**并发 4**·非流式） | 4/4 | **44-45s** |
+| 183KB（并发 4·流式·**经代理**） | 4/4 | **15-33s** |
+
+两个关键推论：
+
+1. **并发不叠加**（4 并发仍 45s，不是 180s）→ 排除客户端压力/连接池问题。
+2. **经代理反而快约 40%** → 直连走的不是最优路由。
+
+### 10054 的真实机制
+
+**不是断连，是超时。** 183KB 请求让免费端点的轻量模型算 40 秒左右，
+Cloudflare 边缘节点在这个时长附近会**掐掉仍在处理中的连接**，
+网关侧看到的就是 `ConnectionResetError`。
+
+26 次重放里**一次 RST 都没复现**——所以别再指望抓到它。
+
+### 哪些请求是「大 payload」
+
+挖`failures.jsonl` 的 `openai_body` 就能认出来，特征很硬：
+
+| 特征 | 分类器请求 | 正常对话 |
+|---|---|---|
+| body 体积 | **178-183 KB** | 小 |
+| system prompt | **140 KB** | 小 |
+| `max_tokens` | 2112 / 10240 / 32000 | 正常 |
+| `stop_sequences` | `['</block>']` | 无 |
+| 结尾 | `MUST begin with <block>` | 无 |
+
+这是 **Claude Code 的 Bash 安全分类器**，不是用户对话。
+所以报错是 `auto mode cannot determine the safety of Bash`，
+表现为「Bash 工具卡住不动」。
+
+### 修法B：自动重试（`retries` / `retry_backoff`）
+
+```python
+def open_upstream_with_retry(oa_req):
+    # 只重试传输层故障，绝不重试上游给出的 4xx/5xx —— 那是答案不是意外
+```
+
+**流式中途失败只在「一个字节都没吐给客户端」时才重试**，
+用 `emitted` 高水位追踪：已吐内容就重放会导致重复输出，
+这时失败比重复更诚实。
+
+新增配置（默认值已写进 `DEFAULT_CONFIG`）：
+
+```json
+{ "retries": 2, "retry_backoff": 1.5 }
+```
+
+退避是 `backoff * 2**i`（1.5s → 3s）。
+
+### 修法 C：走代理（`resolve_upstream_proxy`）
+
+优先级：`upstream.proxy` 显式配置 > `HTTPS_PROXY`/`HTTP_PROXY` 环境变量 > 直连。
+**配置里不写 `proxy` 键**就是「自动跟随环境变量」，
+VPN 换端口时无需改配置。
+
+实现用 **CONNECT 隧道**（`conn.set_tunnel`），
+不是绝对形式请求目标 —— 这样 TLS 端到端，request-target 保持 origin form，
+流式才能正常工作。实测快 40%。
+
+### 验收结果（v1.3.0）
+
+- `/health` 200、非流式 200、流式 SSE 六事件齐全
+- **178KB 真实分类器 payload → 200**
+- 真实 `claude.exe` 多轮工具调用全200，含绝对 URI 形式
+- **failures.jsonl 停在 29 条，新版本零新增**
+
+### 诊断顺序（补充）
+
+1. 先看 `failures.jsonl` 里 `openai_body` 的**体积和 `max_tokens`**，
+   别一上来就查网络连通性 —— 小请求能通不代表大请求能通。
+2. 用**捕获的真实 payload 重放**，小请求测不出这个问题。
+3. 网关启动时打印 `upstream route:` 和 `upstream retries:`。
+   没有这两行，代理是否生效完全不可见 —— 排查时先确认它们。

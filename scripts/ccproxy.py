@@ -27,6 +27,7 @@ import http.client
 import json
 import os
 import secrets
+import socket
 import ssl
 import sys
 import time
@@ -46,6 +47,13 @@ DEFAULT_CONFIG = {
     },
     "drop_reasoning": True,
     "timeout": 900,
+    # Upstream retries for idempotent request shapes. Measured on2026-10-07:
+    # a 183KB classifier payload takes the free endpoint 34-47s, and the
+    # Cloudflare edge in front of it drops connections that are still being
+    # processed at that age. Retrying is safe here because every retried
+    # request is a pure ask-for-a-completion with no side effects.
+    "retries": 2,
+    "retry_backoff": 1.5,
     "verbose": False,
     # Shared secret that local clients must present. Auto-generated on first
     # start so that no other local process can silently use the upstream
@@ -436,15 +444,56 @@ def _dump_failed_request(oa_req, anthropic_req, status, detail):
 
 
 # -------------------------------------------------------------- response side
+def resolve_upstream_proxy(u):
+    """Decide whether to reach the upstream through a proxy.
+
+    Explicit config wins; otherwise fall back to the standard proxy
+    environment variables. Returns (use_proxy, proxy_url).
+    """
+    up = CONFIG.get("upstream", {})
+    explicit = up.get("proxy")
+    if explicit is not None:
+        if not explicit:
+            return False, ""
+        return True, explicit
+
+    scheme_key = "HTTPS_PROXY" if u.scheme == "https" else "HTTP_PROXY"
+    for k in (scheme_key, scheme_key.lower()):
+        v = os.environ.get(k) or ""
+        if v:
+            return True, v
+    # A generic all_proxy should still work for the http scheme fallback.
+    if u.scheme != "https":
+        v = os.environ.get("ALL_PROXY") or os.environ.get("all_proxy") or ""
+        if v:
+            return True, v
+    return False, ""
+
+
 def upstream_request(oa_req):
     u = urlparse(CONFIG["upstream"]["url"])
     timeout = CONFIG.get("timeout", 900)
-    if u.scheme == "https":
+    scheme = u.scheme
+    host = u.hostname
+    port = u.port or (443 if scheme == "https" else 80)
+    use_proxy, proxy_url = resolve_upstream_proxy(u)
+
+    if use_proxy:
+        # CONNECT tunnel: we speak TLS end-to-end with the origin, so the
+        # proxy only relays bytes. This keeps the request-target in origin
+        # form, which streaming requires, while still using the proxy path.
+        pc = urlparse(proxy_url)
+        pport = pc.port or (443 if pc.scheme == "https" else 80)
         conn = http.client.HTTPSConnection(
-            u.hostname, u.port or 443, timeout=timeout,
+            pc.hostname, pport, timeout=timeout,
+            context=ssl.create_default_context())
+        conn.set_tunnel(host, port)
+    elif scheme == "https":
+        conn = http.client.HTTPSConnection(
+            host, port, timeout=timeout,
             context=ssl.create_default_context())
     else:
-        conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=timeout)
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
     path = u.path or "/"
     if u.query:
         path += "?" + u.query
@@ -465,6 +514,67 @@ def upstream_request(oa_req):
     body = json.dumps(oa_req, ensure_ascii=False).encode("utf-8")
     conn.request("POST", path, body=body, headers=headers)
     return conn, conn.getresponse()
+
+
+def _is_retryable_upstream_error(e):
+    """Only retry transport faults, never a decision the upstream made.
+
+    A 4xx/5xx that arrived as a real response is excluded on purpose: those
+    are answers, not accidents, and replaying them wastes the user's time.
+    """
+    if isinstance(e, (ConnectionResetError, ConnectionAbortedError,
+                      BrokenPipeError, ConnectionRefusedError)):
+        return True
+    if isinstance(e, http.client.RemoteDisconnected):
+        return True
+    if isinstance(e, http.client.IncompleteRead):
+        return True
+    if isinstance(e, (socket.timeout, TimeoutError)):
+        return True
+    if isinstance(e, OSError):
+        # Connection-not-established and friends. SSL errors are deliberately
+        # excluded: a TLS failure is usually a proxy misconfiguration and
+        # retrying through the same path just repeats it.
+        return e.errno in (10054, 10060, 10061, 10065, 111, 113)
+    return False
+
+
+def open_upstream_with_retry(oa_req):
+    """Open the upstream, retrying transport faults.
+
+    Returns (conn, resp, attempts). Raises the last error if every attempt
+    failed. The caller must close whichever conn it ends up with, so failed
+    attempts are closed here rather than leaked.
+    """
+    attempts = CONFIG.get("retries", 0)
+    if not isinstance(attempts, int) or attempts < 0:
+        attempts = 0
+    backoff = CONFIG.get("retry_backoff", 1.5)
+    try:
+        backoff = float(backoff)
+    except (TypeError, ValueError):
+        backoff = 1.5
+
+    last = None
+    for i in range(attempts + 1):
+        conn = None
+        try:
+            conn, resp = upstream_request(oa_req)
+            return conn, resp, i + 1
+        except Exception as e:
+            last = e
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            if i >= attempts or not _is_retryable_upstream_error(e):
+                raise
+            delay = backoff * (2 ** i)
+            log_always("upstream %s on attempt %d/%d, retrying in %.1fs: %s"
+                       % (type(e).__name__, i + 1, attempts + 1, delay, e))
+            time.sleep(delay)
+    raise last
 
 
 def openai_to_anthropic(resp, model):
@@ -910,8 +1020,12 @@ class Handler(BaseHTTPRequestHandler):
 
         conn = resp = None
         try:
-            conn, resp = upstream_request(oa_req)
+            conn, resp, _attempts = open_upstream_with_retry(oa_req)
         except Exception as e:
+            log_always("upstream connect failed after retries: %s: %s"
+                       % (type(e).__name__, e))
+            _dump_failed_request(oa_req, req, 599,
+                                 "%s: %s" % (type(e).__name__, e))
             self._send_error_anthropic(502, "api_error", "upstream connect failed: %s" % e)
             if conn:
                 conn.close()
@@ -967,21 +1081,54 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(tr.start())
             self.wfile.flush()
 
-            for line in resp:
-                line = line.strip()
-                if not line.startswith(b"data:"):
-                    continue
-                payload = line[5:].strip()
-                if payload == b"[DONE]":
-                    break
+            # Streamed output is already committed to the client once we write
+            # a chunk, so a mid-stream retry would duplicate text. Track the
+            # high-water mark and only replay while nothing has been emitted;
+            # past that point failing loudly beats silently repeating.
+            emitted = 0
+            mid_retries = CONFIG.get("retries", 0)
+            try:
+                mid_retries = int(mid_retries)
+            except (TypeError, ValueError):
+                mid_retries = 0
+            attempt = 0
+            while True:
                 try:
-                    chunk = json.loads(payload.decode("utf-8"))
-                except Exception:
-                    continue
-                out = tr.feed(chunk)
-                if out:
-                    self.wfile.write(out)
-                    self.wfile.flush()
+                    for line in resp:
+                        line = line.strip()
+                        if not line.startswith(b"data:"):
+                            continue
+                        payload = line[5:].strip()
+                        if payload == b"[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(payload.decode("utf-8"))
+                        except Exception:
+                            continue
+                        out = tr.feed(chunk)
+                        if out:
+                            self.wfile.write(out)
+                            self.wfile.flush()
+                            emitted += len(out)
+                    break
+                except Exception as e:
+                    # Only safe to replay while the client has seen nothing.
+                    # Once bytes are out the only honest options are to fail or
+                    # to append -- and appending would repeat the answer.
+                    if emitted or attempt >= mid_retries \
+                            or not _is_retryable_upstream_error(e):
+                        raise
+                    attempt += 1
+                    delay = float(CONFIG.get("retry_backoff", 1.5)) * (2 ** (attempt - 1))
+                    log_always("stream broke before any output (%s), "
+                               "reopening upstream attempt %d/%d in %.1fs: %s"
+                               % (type(e).__name__, attempt, mid_retries + 1, delay, e))
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                    time.sleep(delay)
+                    conn, resp, _ = open_upstream_with_retry(oa_req)
 
             self.wfile.write(tr.finish())
             self.wfile.flush()
@@ -1053,6 +1200,16 @@ def main():
         CONFIG["verbose"] = True
 
     ensure_client_token(CONFIG)
+
+    # Print the resolved upstream path at startup. A proxy that resolves at
+    # start but dies later is otherwise invisible: every request fails with a
+    # bare 10061 and the log never says a proxy was even involved.
+    _u = urlparse(CONFIG["upstream"]["url"])
+    _use_proxy, _proxy = resolve_upstream_proxy(_u)
+    sys.stderr.write("[ccproxy] upstream route: %s\n"
+                     % (("proxy %s" % _proxy) if _use_proxy else "direct"))
+    sys.stderr.write("[ccproxy] upstream retries: %s (backoff %s)\n"
+                     % (CONFIG.get("retries"), CONFIG.get("retry_backoff")))
 
     host, port = CONFIG["host"], CONFIG["port"]
     srv = QuietThreadingHTTPServer((host, port), Handler)
