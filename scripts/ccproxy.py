@@ -451,10 +451,12 @@ def upstream_request(oa_req):
     headers = {
         "Content-Type": "application/json",
         "Accept": "text/event-stream" if oa_req.get("stream") else "application/json",
-        # Required. Without it http.client sends "Python-urllib/3.x", and
-        # Cloudflare's WAF answers that with 403 "error code: 1010" when the
-        # request arrives via a proxy egress IP. The refusal surfaces here as an
+        # Required. Python's client stack is identified as a known bot by
+        # Cloudflare's WAF, which answers with 403 "error code: 1010" when the
+        # request leaves via a proxy egress IP. The refusal surfaces here as an
         # opaque reset/timeout, which is easy to misread as "upstream down".
+        # Note: bare http.client may send no User-Agent at all, in which case the
+        # refusal looks like a plain connection failure rather than a 403.
         "User-Agent": "ccproxy/1.0 (+local gateway)",
     }
     key = CONFIG["upstream"].get("api_key") or ""

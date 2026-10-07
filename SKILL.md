@@ -645,7 +645,7 @@ req = (b"POST http://127.0.0.1:3457/v1/messages?beta=true HTTP/1.1\r\n"
 但模型其实好好挂着，配置一个字都没错。
 
 **根因**：`ccproxy.py` 原来只发 `Content-Type` + `Accept`，**不发 User-Agent**。
-Python `http.client` 会自动补 `Python-urllib/3.x`，Cloudflare 的 WAF 认这个UA →
+Python 客户端栈（`urllib.request` 会自动加 `Python-urllib/3.x`；裸 `http.client` 则可能干脆不发）被 Cloudflare 的 WAF 识别成机器人 →
 回 `403 error code: 1010`。**且仅在经代理出口 IP 时触发，直连不触发。**
 
 **决定性 A/B 表（各2 次，6/6 稳定复现）**：
