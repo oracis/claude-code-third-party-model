@@ -1296,6 +1296,7 @@ python scripts/ccswitch.py delete <profile> --permanent     # 连付费模型也
 | `scripts/ccproxy.py` | 网关本体（Python 3 **stdlib**，零第三方依赖，约 740 行） |
 | `scripts/ccswitch.py` | profile 切换器 + 网关启停协调（跨平台，约 515 行） |
 | `~/.claude-code-proxy.json` | 配置：`host` / `port` / `upstream{url,model,api_key}` / `timeout` / `verbose` / `client_token` |
+| `examples/claude_model_switcher.pyw` | 桌面 GUI 切换器（双击即用，含删除/刷新模型；`~/.local/bin` 同名文件应从此处同步） |
 | `examples/profiles/*.json` | 开箱可用的 `settings.json` 模板，拷到 `~/.claude/profiles/` |
 
 ```bash
@@ -1505,7 +1506,7 @@ WorkBuddy  ───────────────── OpenAI ───�
 | `x_ccproxy_args` | 传给 ccproxy 的 `--upstream/--model/--key`，避免污染共享的 `~/.claude-code-proxy.json` |
 
 示例见 `~/.claude/profiles/zen-ds-flash.json`。ccswitch 和桌面 GUI
-（`~/.local/bin/claude_model_switcher.pyw`）都认这三个字段。
+（`examples/claude_model_switcher.pyw`，本机位于 `~/.local/bin/claude_model_switcher.pyw`）都认这三个字段。
 
 ## 四个必须记住的点
 

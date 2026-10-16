@@ -10,6 +10,9 @@
 > 本仓库本身是一份 **AI Skill**（`SKILL.md`）。用 WorkBuddy / Claude Code 等 agent 时，
 > 把 `SKILL.md` 装进 skills 目录，agent 就能自己照着做诊断和配置。
 
+**桌面 GUI 切换器**：`examples/claude_model_switcher.pyw`（双击即用，点哪个模型就切到哪个 profile，
+底部带「删除所选模型 / 刷新列表」）。换机器重装后从这里拷回 `~/.local/bin/` 即可，本仓库即其源头。
+
 ---
 
 ## 两条路线
@@ -255,6 +258,7 @@ Claude Code 有**多套**模型配置（`ANTHROPIC_MODEL`、`ANTHROPIC_DEFAULT_O
 │   ├── ccswitch.py                 # profile 一键切换 / 删除 + 网关启停协调
 │   └── zen_bridge.py               # Zen 免费模型专用桥接（→ opencode serve → Zen）
 └── examples/
+    ├── claude_model_switcher.pyw   # 桌面 GUI 切换器（双击即用，含删除/刷新模型；本机 ~/.local/bin 同名文件应从此处同步）
     └── profiles/
         └── deepseek.json           # 原生 Anthropic 端点模板（key 留空，需自己填）
 ```
