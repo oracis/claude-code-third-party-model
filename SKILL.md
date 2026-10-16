@@ -941,6 +941,7 @@ if defined OLD taskkill /F /PID !OLD!
 > | `zen-nemotron-vl` | `nemotron-3.5-super-vl-free` | 3464 | 1M | 6.9s |
 > | `zen-big-pickle` | `big-pickle` | 3468 | 200k | 12.1s |
 > | `zen-space-bunny` 👑 | `space-bunny-free` | 3463 | 1M | **1.3s** |
+> | `zen-ll-alpha` | `ll-alpha-free` | 3469 | 256k | 3.5s |
 > | `zen-ds-flash` | `deepseek-v4.1-flash-free` | 3462 | 200k | 4.0s |
 >
 > 不可用：`jev-1.13-free`(500)、`cat-jam-free` 与 `muse-spark-1.3-contributor-free`

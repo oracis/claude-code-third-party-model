@@ -58,6 +58,7 @@ KNOWN_FREE = [
     "deepseek-v4.1-flash-free",
     "space-bunny-free",
     "big-pickle",
+    "ll-alpha-free",
     "nemotron-3.5-super-vl-free",
     "mimo-v2.6-flash-free",
     "longcat-2.5-preview-free",

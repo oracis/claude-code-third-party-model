@@ -43,6 +43,9 @@ MODELS = [
     ("👑 Space Bunny Free（免费·Zen·1M·实测最快）", "zen-space-bunny", 3463,
      "--upstream http://127.0.0.1:8787/v1/chat/completions "
      "--model space-bunny-free --key anonymous", True),
+    ("LL Alpha Free（免费·Zen·256k·输出64k）", "zen-ll-alpha", 3469,
+     "--upstream http://127.0.0.1:8787/v1/chat/completions "
+     "--model ll-alpha-free --key anonymous", True),
     ("Nemotron 3.5 Super-VL（免费·Zen·1M）", "zen-nemotron-vl", 3464,
      "--upstream http://127.0.0.1:8787/v1/chat/completions "
      "--model nemotron-3.5-super-vl-free --key anonymous", True),
@@ -78,6 +81,7 @@ PREFERRED_PROFILE = "zen-space-bunny"
 DEL_LABELS = {
     "zen-ds-flash": "DS V4.1 Flash 免费·Zen",
     "zen-space-bunny": "👑 Space Bunny 免费·最快",
+    "zen-ll-alpha": "LL Alpha 免费·256k",
     "zen-nemotron-vl": "Nemotron VL 免费·1M",
     "zen-longcat": "LongCat 免费·1M",
     "zen-mimo": "MiMo V2.6 免费",
