@@ -2,7 +2,7 @@
 name: claude-code-third-party-model
 slug: claude-code-third-party-model
 displayName: Claude Code 接入第三方模型
-version: 1.3.0
+version: 1.4.0
 license: MIT
 category: dev-programming
 subCategories: [dev-script, dev-bug-fix]
@@ -921,7 +921,15 @@ if defined OLD taskkill /F /PID !OLD!
 # 第五部分：只有 OpenAI 兼容端点的模型 → 必须加本地网关
 
 **适用**：模型只在 OpenAI 兼容网关上提供，没有 Anthropic 原生端点。
-典型是 Space Bunny（2026-09 匿名免费预览，1M 上下文，强制推理、五档 reasoning effort，$0）。
+典型是 OpenCode Zen 的免费层（2026-09 时是 Space Bunny，1M 上下文、强制推理、五档 effort、$0）。
+
+> 🗑️ **2026-10-16 更新：Space Bunny / `space-bunny-free` 已下线，别再用。**
+> Zen 免费层换成了 `deepseek-v4.1-flash-free`（同样免 key，但**不能直连**——
+> 直连会报 `FreeTierError: only used from within OpenCode`，必须走 opencode SDK）。
+> 现役链路与配置见 **第八部分：Zen 免费模型的两段式链路**。profile 已改为
+> `zen-ds-flash`，旧的 `spacebunny` profile 与 `examples/profiles/spacebunny.json`
+> 均已移除（备份在 `~/.workbuddy/backups/spacebunny-cleanup-*`）。
+> 本部分剩余内容保留作 **OpenAI→Anthropic 网关类问题** 的历史排查参考。
 
 > ⚠️ **2026-09-29 重大更正：`claude-code-router` 的流式转换是坏的，不要再拿它做方案。**
 > 实测 v2.1.1（npm 上只有 2.1.0/2.1.1，**没有修复版**）输出的 Anthropic SSE：
@@ -939,16 +947,17 @@ if defined OLD taskkill /F /PID !OLD!
 
 **同一个 stealth 模型往往有多个上游，优先选免 key 的那个**：
 
-| 上游 | 端点 | 模型名 | 认证 |
-|---|---|---|---|
-| **OpenCode Zen** | `https://opencode.ai/zen/v1/chat/completions` | `space-bunny-free` | **免 key（匿名）可用** |
-| OpenRouter | `https://openrouter.ai/api/v1/chat/completions` | `stealth/space-bunny-alpha` | 需 key（注意：整段 `:free` 后缀会 404） |
-| AI/ML API | `https://api.aimlapi.com/v1/chat/completions` | `stealth/space-bunny-alpha` | 需 key |
+| 上游 | 端点 | 模型名 | 认证 | 状态 |
+|---|---|---|---|---|
+| **OpenCode Zen** | `https://opencode.ai/zen/v1/chat/completions` | `deepseek-v4.1-flash-free` | **免 key（匿名）** | ✅ 现役，但**必须走 opencode SDK**（见第八部分） |
+| OpenCode Zen | 同上 | `space-bunny-free` | 免 key | ❌ **2026-10-16 已下线** |
+| OpenRouter | `https://openrouter.ai/api/v1/chat/completions` | `stealth/space-bunny-alpha` | 需 key（注意：整段 `:free` 后缀会 404） | ❌ 随模型下线 |
+| AI/ML API | `https://api.aimlapi.com/v1/chat/completions` | `stealth/space-bunny-alpha` | 需 key | ❌ 随模型下线 |
 
-- **OpenCode Zen 免 key 实测（2026-09-29）**：不带任何 `Authorization` 头直接 POST
-  `space-bunny-free` 即返回真实结果、`cost:"0"`。**账号被封也不用怕，直接换 Zen。**
-  （限时免费，约 ~2026-09-30 到期；`@namzu/zen` 也称 keyless 走 `space-bunny-free`，
-  但「网关准入随时可能变」。）
+- **Zen 免 key 的代价（2026-10-16 实测）**：Zen 免费层**只接受从 opencode 客户端/SDK 发出的
+  请求**。匿名直连 endpoint 会 `FreeTierError: only used from within OpenCode`，
+  改 `User-Agent` 伪装无效；甚至用 python `urllib` 打 `opencode.ai` 还会被
+  Cloudflare `403 error code: 1010` 拦。所以现役方案是 `opencode serve` + 本地桥接。
 - 两条通道 **模型 ID 不同**：Zen 带 `-free` 后缀，OpenRouter 不带 `:free` 后缀。
 
 ## 为什么必须过网关
@@ -1022,6 +1031,9 @@ cd "C:/Users/<u>/.workbuddy/binaries/node/workspace"
 > **不在** workspace 里（踩过）。
 
 ## 配置模板：`~/.claude-code-router/config-router.json`
+
+> 历史示例（模型名 `space-bunny-free` 已下线，仅作格式参考；新搭建请用第七部分的
+> `ccproxy.py` + 第八部分的 `zen_bridge.py`）。
 
 ```json
 {
@@ -1182,7 +1194,8 @@ python scripts/ccswitch.py gateway
 
 ## 已知限制
 
-- Space Bunny 是**强制推理**模型，默认 effort 较高（偏慢）。想提速要调 reasoning effort，
+- ~~Space Bunny 是**强制推理**模型，默认 effort 较高（偏慢）~~（模型已下线，2026-10-16）。
+  现役的 `deepseek-v4.1-flash-free` 同样支持六档 effort（minimal/low/medium/high/xhigh/max），
   但 Claude Code 的 `CLAUDE_CODE_EFFORT_LEVEL` 经网关**未必能传下去**（同 Step 9，
   很可能是空操作），需要实测确认。
 - 匿名 stealth 模型规格/数据政策未公开（提供方可能保留 prompt，不用于训练），
@@ -1192,20 +1205,50 @@ python scripts/ccswitch.py gateway
 
 # 第六部分：多 profile 一键切换（ccswitch）
 
-**目标**：用户说一句「切 deepseek」/「切 space bunny」就完成切换，不再手工改配置。
+**目标**：用户说一句「切 deepseek」/「切 zen」就完成切换，不再手工改配置。
 
 ## 用法
 
 ```bash
 python scripts/ccswitch.py deepseek          # 切到 DeepSeek 原生端点
-python scripts/ccswitch.py spacebunny        # 切到 Space Bunny（自动拉起网关）
+python scripts/ccswitch.py zen-ds-flash      # 切到 Zen 免费模型（自动拉起桥接+网关）
 python scripts/ccswitch.py status            # 当前 profile + 网关状态
 python scripts/ccswitch.py list              # 列出所有 profile
 python scripts/ccswitch.py gateway           # 只确保网关在跑
 python scripts/ccswitch.py <p> --no-gateway  # 只改 settings，不动网关
 ```
 
-别名：`ds`→deepseek，`bunny`/`sb`/`zen`→spacebunny。
+别名：`ds`/`deepseek-flash`→deepseek，`zen`/`opencode-zen`/`zen-ds`/`ds-flash`→zen-ds-flash。
+
+> 🗑️ `spacebunny` profile 已于 2026-10-16 随模型下线移除。旧别名 `bunny`/`sb`/`space-bunny`
+> 现在统一指向 `zen-ds-flash`，不会再报「unknown profile」。
+
+## 删除模型（免费模型过期/失效时用）
+
+免费模型说没就没，删一个模型的所有入口（切换器 GUI、`ccswitch list`）立即失效，
+不用改代码、不用重新部署：
+
+```bash
+python scripts/ccswitch.py delete <profile>                 # 交互确认（y/N）
+python scripts/ccswitch.py delete <profile> --yes           # 跳过确认
+python scripts/ccswitch.py delete <profile> --permanent     # 连付费模型也真删
+```
+
+**免费模型是真删，付费模型才归档**：
+- profile 带 `"x_free": true` → `os.remove` **直接删除，不留 backup**
+  （免费模型要么不好用、要么已失效，没有保留价值；想重建随时加回来）。
+- 付费模型（用自己的 key，如 deepseek）→ 移入 `~/.claude/backups/deleted/`，
+  想恢复就拷回 `profiles/`。
+- `--permanent` 可强制真删任何 profile（含付费）。
+- `ccswitch list` 会显示 `[free]` / `[paid]` 标记，删前可分辨。
+
+其它注意：
+- 删的是**当前生效**的 profile 时会警告：`settings.json` 本身不动，但从此没有 profile
+  与它对应，删完建议再切一个别的模型。
+- 删不存在的 profile 直接报错并列出现有 profile，不会误伤。
+- GUI 切换器（`claude_model_switcher.pyw`）底部有同样的「删除所选模型」下拉框，
+  下拉显示「显示名 [profile名]」（分得清免费/付费），免费模型确认弹窗会明示
+  「永久删除、不留 backup」，逻辑与 CLI 一致。
 
 ## 设计（可直接照搬到别的工具）
 
@@ -1261,9 +1304,11 @@ python ccproxy.py --upstream <url> --model <name> --key <k>  # 临时换上游
 curl -s -H "x-api-key: $TOKEN" http://127.0.0.1:3457/health  # {"ok":true,"service":"ccproxy",...}
 ```
 
-CLI 参数优先于配置文件（且**不会**被写回配置文件）。当前上游：
-`https://opencode.ai/zen/v1/chat/completions` + `space-bunny-free` + **空 api_key**
-（Zen 免 key；填任何占位值都会被 `AuthError: Invalid API key` 拒）。
+CLI 参数优先于配置文件（且**不会**被写回配置文件）。当前上游（本机现役）：
+`http://127.0.0.1:8787/v1/chat/completions`（= 本地 zen_bridge，再经 opencode SDK 到 Zen）
++ `deepseek-v4.1-flash-free` + **空 api_key**。
+（旧写法 `https://opencode.ai/zen/v1/chat/completions` + `space-bunny-free` 已随模型下线失效：
+直连 Zen 现在一律 `FreeTierError`。见第八部分。）
 
 ## 安全设计（默认即如此，不用额外配置）
 
@@ -1431,3 +1476,53 @@ VPN 换端口时无需改配置。
 2. 用**捕获的真实 payload 重放**，小请求测不出这个问题。
 3. 网关启动时打印 `upstream route:` 和 `upstream retries:`。
    没有这两行，代理是否生效完全不可见 —— 排查时先确认它们。
+
+---
+
+# 第四部分：Zen 免费模型的两段式链路（2026-10-16）
+
+OpenCode Zen 的免费模型（如 `deepseek-v4.1-flash-free`）**不能直连**，也不在
+`opencode models` 的 catalog 里；只有把请求包成 opencode 自己的会话才能用。
+所以链路变成两段中继：
+
+```
+Claude Code ──Anthropic──> ccproxy:3462 ──OpenAI──> zen_bridge:8787 ──SDK──> opencode serve:41234 ──> Zen
+WorkBuddy  ───────────────── OpenAI ───────────────> zen_bridge:8787 ──┘
+```
+
+`scripts/zen_bridge.py`（零依赖单文件）负责 OpenAI `<->` opencode SDK 的转换，
+`opencode serve` 由桥接用 `--auto-start` 自动拉起。
+
+## profile 的自描述字段（`x_*`）
+
+带 `x_` 前缀的键是 **ccswitch 专用提示**，永远不会被写进 `settings.json`
+（`strip_internal()` 会剥掉），也不参与 `same_json` 比对：
+
+| 字段 | 作用 |
+|---|---|
+| `x_bridge: true` | 切换时先确保 `zen_bridge` 在跑 |
+| `x_gateway_port` | 该 profile 专用的 ccproxy 端口（不同上游不能共用一个端口） |
+| `x_ccproxy_args` | 传给 ccproxy 的 `--upstream/--model/--key`，避免污染共享的 `~/.claude-code-proxy.json` |
+
+示例见 `~/.claude/profiles/zen-ds-flash.json`。ccswitch 和桌面 GUI
+（`~/.local/bin/claude_model_switcher.pyw`）都认这三个字段。
+
+## 四个必须记住的点
+
+1. **ccproxy 忽略请求体里的 model**（源码 408 行只取 `CONFIG["upstream"]["model"]`），
+   所以 profile 里写 `xxx[1m]` 只影响 UI 显示，实际转发永远是 `--model` 指定的值。
+2. **工具调用是靠提示词模拟的**：opencode SDK 的 `tools` 字段只接受
+   `{工具名: true/false}` 开关内置工具，注册不了外部 OpenAI 工具。做法是把工具清单
+   + JSON 契约喂给模型，再解析成标准 `tool_calls`。
+3. **工具指令必须放用户消息里，放 `system` 会被 opencode 的 agent 提示压掉**
+   —— 实测放 system 时模型转头用内置工具干活，把 `ls` 结果写成中文叙述，还耗时 148 秒。
+   但**身份类指令放 system 是有效的**（弱约束不会被压）。
+4. **冷启动约 9-10 秒**（桥接 + `opencode serve`）；热调用 2-6 秒。
+   切换器的 `ensure_bridge()` 会轮询 `/healthz` 等待就绪，不要缩短那个超时。
+
+## 已知限制
+
+- **流式没有打字机效果**：opencode 的 `/message` 不支持 SSE（`Accept: text/event-stream`
+  也只回 JSON），所以是一次性吐出全文。对 Claude Code 无影响（事件序列依然合规，
+  含 `message_stop`）。
+- 桥接**复用**已运行实例，所以首次之后改桥接启动参数不会生效 —— 要改就得先停掉它。

@@ -3,8 +3,9 @@
 **Connect Claude Code to any third-party model — native Anthropic endpoints, or OpenAI-only ones via a zero-dependency local gateway.**
 
 把 Claude Code 接到任意第三方模型上：DeepSeek / Kimi / GLM 这类有 Anthropic 兼容端点的直接改配置；
-只有 OpenAI 兼容端点的模型（如 Space Bunny）需要一层本地协议转换网关。本仓库同时提供
-**协议转换网关**、**一句话切换器**，以及把这条路上所有坑讲清楚的排查手册。
+只有 OpenAI 兼容端点的模型（如 OpenCode Zen 免费层、OpenRouter 上的 stealth 模型）需要一层本地
+协议转换网关。本仓库同时提供**协议转换网关**、**一句话切换器（含删除）**，以及把这条路上所有坑
+讲清楚的排查手册。
 
 > 本仓库本身是一份 **AI Skill**（`SKILL.md`）。用 WorkBuddy / Claude Code 等 agent 时，
 > 把 `SKILL.md` 装进 skills 目录，agent 就能自己照着做诊断和配置。
@@ -16,7 +17,7 @@
 | 你的模型 | 做法 | 需要网关吗 |
 |---|---|---|
 | **有 Anthropic 兼容端点**<br>DeepSeek `/anthropic`、Kimi、GLM 等 | 直接把 `ANTHROPIC_BASE_URL` 指过去 | ❌ 不需要 |
-| **只有 OpenAI 兼容端点**<br>OpenRouter 上的模型、Space Bunny、各类 stealth 模型 | 本地起 `ccproxy.py` 做 Anthropic ↔ OpenAI 翻译 | ✅ 必须 |
+| **只有 OpenAI 兼容端点**<br>OpenRouter 上的模型、OpenCode Zen 免费层、各类 stealth 模型 | 本地起 `ccproxy.py` 做 Anthropic ↔ OpenAI 翻译 | ✅ 必须 |
 
 关键判断：**看模型提供方给的是不是 Anthropic Messages 协议**。给 OpenAI 格式的
 （`/v1/chat/completions`）就必须转换——Claude Code 不会说 OpenAI 那套。
@@ -45,7 +46,10 @@
 
 ```bash
 # 1) 起网关（零依赖，Python 3 标准库，无需 pip install）
-python scripts/ccproxy.py --port 3457 --upstream https://opencode.ai/zen/v1/chat/completions --model space-bunny-free
+#    以 OpenCode Zen 免费层为例：它只接受 opencode 客户端/SDK 发出的请求，
+#    所以先起 scripts/zen_bridge.py（内部转发到 opencode serve），网关再指向桥接。
+python scripts/zen_bridge.py --port 8787 --sdk-port 41234 --auto-start
+python scripts/ccproxy.py --port 3457 --upstream http://127.0.0.1:8787/v1/chat/completions --model deepseek-v4.1-flash-free
 #    首次启动会生成一个客户端令牌，存进 ~/.claude-code-proxy.json
 
 # 2) 另开一个终端，带令牌确认网关活着（不带令牌会返回 401）
@@ -65,14 +69,20 @@ curl -s -H "x-api-key: $TOKEN" http://127.0.0.1:3457/health
   "host": "127.0.0.1",
   "port": 3457,
   "upstream": {
-    "url": "https://opencode.ai/zen/v1/chat/completions",
-    "model": "space-bunny-free",
+    "url": "http://127.0.0.1:8787/v1/chat/completions",
+    "model": "deepseek-v4.1-flash-free",
     "api_key": ""
   },
   "drop_reasoning": true,
   "timeout": 900
 }
 ```
+
+> OpenCode Zen 免费层（`deepseek-v4.1-flash-free`）**不能直连**：匿名直连会被
+> `FreeTierError: only used from within OpenCode` 拒。`http://127.0.0.1:8787` 是
+> 本仓库 `zen_bridge.py` 的本地端口，它经 opencode SDK 转发到 Zen。其它普通
+> OpenAI 上游（OpenRouter 等）直接写真实端点即可，不需要桥接。
+> 已下线的 `space-bunny-free`（2026-10-16 起 Zen 不再提供）请不要再用了。
 
 ---
 
@@ -113,18 +123,32 @@ profile 即模板：`~/.claude/profiles/<名字>.json` 存一份完整的 `setti
 
 ```bash
 python scripts/ccswitch.py deepseek      # 切到 DeepSeek 原生端点（自动停掉不再需要的网关）
-python scripts/ccswitch.py spacebunny    # 切到需要网关的模型（自动把网关拉起来）
+python scripts/ccswitch.py zen-ds-flash  # 切到需要网关的模型（自动把网关/桥接拉起来）
 python scripts/ccswitch.py status        # 当前 profile + 网关状态
 python scripts/ccswitch.py list          # 列出所有 profile
 python scripts/ccswitch.py gateway       # 只确保网关在跑，不切换
 ```
 
-别名：`ds` → deepseek，`bunny` / `sb` / `zen` → spacebunny。
+别名：`ds` → deepseek，`zen` / `opencode-zen` / `zen-ds` / `ds-flash` → zen-ds-flash。
+
+**模型过期/失效了？删掉就行**（免费模型说没就没，不用改代码）：
+
+```bash
+python scripts/ccswitch.py delete <profile>                 # 交互确认后删除
+python scripts/ccswitch.py delete <profile> --yes           # 跳过确认
+python scripts/ccswitch.py delete <profile> --permanent     # 连付费模型也真删
+```
+
+- **免费模型（profile 带 `x_free`）是真删**——`os.remove` 直接干掉，不留 backup
+  （免费模型要么不好用、要么已失效，没有保留价值，想重建随时加回来）。
+- **付费模型**（用自己的 key）才归档：移入 `~/.claude/backups/deleted/`，可拷回恢复。
+- `ccswitch list` 带 `[free]` / `[paid]` 标记；切换器 GUI 底部的「删除所选模型」
+  下拉显示「显示名 [profile名]」，免费模型确认弹窗会明示「永久删除、不留 backup」。
 
 要不要网关**不靠额外元数据判断**，而是从配置自己推：`ANTHROPIC_BASE_URL` 指向
 `127.0.0.1:<网关端口>` 就需要，指向别的（如 `api.deepseek.com/anthropic`）就不需要。
 
-`examples/profiles/` 下有两份可直接用的模板，拷到 `~/.claude/profiles/` 即可：
+`examples/profiles/` 下有可直接用的模板，拷到 `~/.claude/profiles/` 即可：
 
 ```bash
 cp examples/profiles/*.json ~/.claude/profiles/
@@ -138,10 +162,10 @@ cp examples/profiles/*.json ~/.claude/profiles/
 
 ```json
 {
-  "id": "space-bunny-free",
-  "name": "Space Bunny",
+  "id": "deepseek-v4.1-flash-free",
+  "name": "DeepSeek V4.1 Flash (Zen 免费)",
   "vendor": "OpenCode Zen",
-  "url": "https://opencode.ai/zen/v1/chat/completions",
+  "url": "http://127.0.0.1:8787/v1/chat/completions",
   "apiKey": " ",
   "supportsToolCall": true,
   "supportsReasoning": true
@@ -228,11 +252,11 @@ Claude Code 有**多套**模型配置（`ANTHROPIC_MODEL`、`ANTHROPIC_DEFAULT_O
 ├── LICENSE                         # MIT
 ├── scripts/
 │   ├── ccproxy.py                  # Anthropic ↔ OpenAI 协议转换网关（零依赖）
-│   └── ccswitch.py                 # profile 一键切换 + 网关启停协调
+│   ├── ccswitch.py                 # profile 一键切换 / 删除 + 网关启停协调
+│   └── zen_bridge.py               # Zen 免费模型专用桥接（→ opencode serve → Zen）
 └── examples/
     └── profiles/
-        ├── deepseek.json           # 原生 Anthropic 端点模板（key 留空，需自己填）
-        └── spacebunny.json         # 需网关的模板
+        └── deepseek.json           # 原生 Anthropic 端点模板（key 留空，需自己填）
 ```
 
 ---
@@ -265,7 +289,7 @@ curl -sN http://127.0.0.1:3457/v1/messages \
 - **平台**：Windows / macOS / Linux 均可。`ccswitch.py` 的网关进程管理做了跨平台分支
   （Windows 走 `netstat` + `taskkill`，POSIX 走 pidfile + `SIGTERM`）。
 - **Python**：3.8+，只用标准库，**不需要 `pip install` 任何东西**。
-- **强制推理模型**：像 Space Bunny 这类模型会把推理 token 算进 `max_tokens`，
+- **强制推理模型**：像 Zen 免费层这类模型会把推理 token 算进 `max_tokens`，
   给太小会出现"空回复"（内容被推理吃光）。给 1000+ 比较稳。
 - **匿名 / stealth 模型**：规格与数据政策通常未公开，提供方**可能保留 prompt**。
   别用于敏感或强合规场景。

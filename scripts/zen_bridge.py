@@ -1,0 +1,641 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+zen_bridge.py —— 零依赖单文件桥接：OpenAI 兼容端点  ->  opencode serve 的 SDK API
+
+为什么需要它：
+    OpenCode Zen 的免费模型（如 deepseek-v4.1-flash-free）已限制只能在 OpenCode 客户端内调用，
+    直连 HTTP 一律返回 FreeTierError。但 opencode 自带的 headless server（`opencode serve`）
+    会代理这些请求。本脚本把标准的 OpenAI /v1/chat/completions 请求翻译成 opencode 的 SDK 调用，
+    于是任何支持 OpenAI 协议的客户端（WorkBuddy 自定义模型、Claude Code、Cline、curl…）都能用上。
+
+用法：
+    python zen_bridge.py                        # 监听 127.0.0.1:8787
+    python zen_bridge.py --port 9000            # 换端口
+    python zen_bridge.py --model deepseek-v4.1-flash-free
+    python zen_bridge.py --sdk-port 41234 --auto-start
+
+可选的客户端配置（以 WorkBuddy 为例，models.json 里加一条）：
+    {"id":"deepseek-v4.1-flash-free","name":"DS V4.1 Flash Free",
+     "vendor":"opencode","url":"http://127.0.0.1:8787/v1/chat/completions",
+     "apiKey":"sk-local","supportsToolCall":false,"supportsImages":true,"supportsReasoning":true}
+
+已知限制：
+    * 上游 opencode 的 /message 不支持 SSE，始终整段返回 -> 本桥接的 stream 是「一个 delta 吐完」，
+      不是逐 token 流式；语义正确，但没有打字机效果
+    * OpenAI 的 tools / function calling 不透传（opencode 自己会不会调工具由它的 agent 决定）
+    * 每次请求默认新建 session 并在结束后删除，因此跨请求不保留上下文；
+      客户端需要靠 messages 数组自带历史（桥接会把历史拼成带 role 前缀的文本）
+    * 依赖 opencode serve 在跑；可加 --auto-start 让它自己拉起
+"""
+
+import argparse
+import atexit
+import base64
+import http.client
+import json
+import mimetypes
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PROVIDER = "opencode"
+DEFAULT_MODEL = "deepseek-v4.1-flash-free"
+# opencode 里常见的免费模型，只用于 /v1/models 展示，实际转发不限制
+# （space-bunny-free 于 2026-10-16 被 Zen 下线，已从列表移除）
+KNOWN_FREE = [
+    "deepseek-v4.1-flash-free",
+    "ling-3.1-flash-free",
+    "mimo-v2.6-flash-free",
+    "nemotron-3.5-lightning-free",
+    "step-5-preview-free",
+    "longcat-2.5-preview-free",
+    "exo-free",
+]
+
+_lock = threading.Lock()
+
+
+def log(msg):
+    print("[%s] %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
+
+
+class OpencodeSDK:
+    """薄封装：本地 opencode serve 的 REST SDK。"""
+
+    def __init__(self, port, auto_start=False, opencode_bin=None, agent=None,
+                 keep_session=False):
+        self.port = port
+        self.auto_start = auto_start
+        self.opencode_bin = opencode_bin
+        self.agent = agent
+        self.keep_session = keep_session
+        self._session_id = None
+        self._proc = None
+        atexit.register(self._cleanup)
+
+    def _cleanup(self):
+        """退出时收掉由本进程拉起的 opencode serve。"""
+        if self._proc and self._proc.poll() is None:
+            log("关闭 opencode serve (pid=%s)" % self._proc.pid)
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=10)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+
+    # ---------- 底层请求 ----------
+    def _req(self, method, path, body=None, timeout=600):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
+        headers = {"Accept": "application/json"}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        try:
+            conn.request(method, path, body=data, headers=headers)
+            resp = conn.getresponse()
+            raw = resp.read().decode("utf-8", "replace")
+            status = resp.status
+        finally:
+            conn.close()
+        return status, raw
+
+    # ---------- 服务存活 / 拉起 ----------
+    def alive(self):
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
+            conn.request("GET", "/session")
+            conn.getresponse().read()
+            conn.close()
+            return True
+        except Exception:
+            return False
+
+    def ensure(self):
+        if self.alive():
+            return True
+        if not self.auto_start:
+            log("opencode serve 未在 127.0.0.1:%d 运行，请先在终端执行：opencode serve --port %d"
+                % (self.port, self.port))
+            return False
+        exe = _find_opencode(self.opencode_bin)
+        if not exe:
+            log("找不到 opencode 可执行文件")
+            return False
+        log("拉起 opencode serve --port %d ..." % self.port)
+        creationflags = 0
+        startupinfo = None
+        if os.name == "nt":
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        self._proc = subprocess.Popen(
+            [exe, "serve", "--port", str(self.port)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
+            creationflags=creationflags, startupinfo=startupinfo,
+        )
+        for _ in range(120):
+            time.sleep(1)
+            if self.alive():
+                log("opencode serve 已就绪")
+                return True
+        log("opencode serve 启动超时")
+        return False
+
+    def _session_alive(self, sid):
+        try:
+            st, _ = self._req("GET", "/session/%s" % sid, timeout=10)
+            return st == 200
+        except Exception:
+            return False
+
+    # ---------- 一次对话 ----------
+    def complete(self, model_id, openai_parts, system_text, agent=None):
+        """返回 (assistant_text, usage_dict)。"""
+        with _lock:
+            sid = None
+            if self.keep_session and self._session_id:
+                if self._session_alive(self._session_id):
+                    sid = self._session_id
+                else:
+                    self._session_id = None
+            if sid is None:
+                st, raw = self._req("POST", "/session", {
+                    "title": "zen-bridge " + time.strftime("%m-%d %H:%M:%S"),
+                    "model": {"id": model_id, "providerID": PROVIDER},
+                }, timeout=30)
+                if st != 200:
+                    raise RuntimeError("create session failed: %s %s" % (st, raw[:300]))
+                sid = json.loads(raw)["id"]
+                if self.keep_session:
+                    self._session_id = sid
+
+        body = {
+            "parts": openai_parts,
+            "model": {"providerID": PROVIDER, "modelID": model_id},
+        }
+        if system_text:
+            body["system"] = system_text
+        agent = agent or self.agent
+        if agent:
+            body["agent"] = agent
+
+        st, raw = self._req("POST", "/session/%s/message" % sid, body)
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            raise RuntimeError("bad upstream response: %s" % raw[:300])
+        if st != 200:
+            raise RuntimeError("message failed: HTTP %s %s" % (st, raw[:300]))
+
+        parts = msg.get("parts") or []
+        texts = [p.get("text", "") for p in parts if p.get("type") == "text"]
+        answer = "".join(texts).strip()
+        tokens = msg.get("info", {}).get("tokens", {}) or {}
+
+        # 顺手清理会话，避免 opencode 本地库不断膨胀（keep_session 模式保留）
+        if not self.keep_session:
+            try:
+                self._req("DELETE", "/session/%s" % sid, timeout=15)
+            except Exception:
+                pass
+
+        usage = {
+            "prompt_tokens": tokens.get("input", 0),
+            "completion_tokens": tokens.get("output", 0),
+            "total_tokens": tokens.get("total", 0) or (
+                tokens.get("input", 0) + tokens.get("output", 0)),
+        }
+        return answer, usage
+
+
+def _find_opencode(user_supplied=None):
+    """定位 opencode 可执行文件。"""
+    if user_supplied and os.path.isfile(user_supplied):
+        return user_supplied
+    exe = "opencode.exe" if os.name == "nt" else "opencode"
+    from shutil import which
+    found = which(exe)
+    if found:
+        return found
+    home = os.path.expanduser("~")
+    cand = os.path.join(home, ".opencode", "bin", exe)
+    if os.path.isfile(cand):
+        return cand
+    return None
+
+
+# ---------------- OpenAI 请求 -> opencode parts ----------------
+
+TOOL_INSTRUCTION = """You have access to the following tools:
+{tools}
+
+Rules for tool use:
+- If the request should be answered by calling tool(s), reply with EXACTLY ONE line of JSON and nothing else, in this shape:
+  {{"calls":[{{"id":"call_1","name":"<tool_name>","arguments":{{<object matching that tool's parameters>}}}}]}}
+- Put multiple objects inside "calls" if several calls are needed.
+- Arguments must be a JSON object; use exact parameter names from the tool definition.
+- If no tool fits, or the answer needs no tool, reply in plain natural language instead.
+- Never invent a tool name that is not in the list above.
+- Do NOT wrap the JSON in code fences."""
+
+_FENCE_RE = re.compile(r"^```(?:json|JSON)?\s*|\s*```$")
+
+
+def build_tools_digest(tools):
+    """OpenAI tools 数组 -> 给模型看的精简清单（控制长度，别把上下文撑爆）。"""
+    items = []
+    for t in tools:
+        fn = t.get("function", t)
+        name = fn.get("name")
+        if not name:
+            continue
+        desc = (fn.get("description") or "").strip().replace("\n", " ")
+        params = fn.get("parameters") or {}
+        compact = params
+        # 只保留最有用的字段，properties 里的说明省略
+        if isinstance(params, dict) and "properties" in params:
+            props = {}
+            for k, v in (params.get("properties") or {}).items():
+                if isinstance(v, dict):
+                    props[k] = v.get("type", "any") + (
+                        " // " + v.get("description", "") if v.get("description") else "")
+                else:
+                    props[k] = v
+            compact = {"type": params.get("type", "object"),
+                       "properties": props,
+                       "required": params.get("required", [])}
+        items.append({"name": name, "description": desc[:200],
+                      "parameters": compact})
+    digest = json.dumps(items, ensure_ascii=False)
+    if len(digest) > 4000:
+        digest = digest[:4000] + "...(truncated)"
+    return digest
+
+
+def _with_tool_prefix(parts, prefix):
+    """把工具指令前置到用户正文里（不能放 system，会被 agent 提示压掉）。"""
+    out = []
+    injected = False
+    for p in parts:
+        if p.get("type") == "text" and not injected:
+            out.append({"type": "text",
+                        "text": prefix + "\n\nUser request:\n" + p.get("text", "")})
+            injected = True
+        else:
+            out.append(p)
+    if not injected:
+        out.append({"type": "text", "text": prefix + "\n\nUser request:\n(empty)"})
+    return out
+
+
+def extract_first_json(text):
+    """扫出文本里第一个完整的 JSON 对象/数组。
+
+    不能简单用 find('{') / find('[') 切：那样会截到串内部的下标导致 JSON 损坏
+    （踩过：JSON 以 '{' 开头，却因为内部有 '[' 被从中间切断 -> json.loads 报 Extra data）。
+    用 raw_decode 逐个起点尝试最稳。
+    """
+    dec = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch in "{[":
+            try:
+                obj, _ = dec.raw_decode(text[i:])
+                return obj
+            except Exception:
+                continue  # 这个起点不是完整 JSON，换下一个
+    return None
+
+
+def parse_tool_calls(text, valid_names):
+    """从模型回复里尽力抠出工具调用，返回 OpenAI 的 tool_calls 列表（失败返回 []）。"""
+    cand = text.strip()
+    cand = _FENCE_RE.sub("", cand).strip()
+    obj = extract_first_json(cand)
+    if obj is None:
+        return []
+
+    if isinstance(obj, dict):
+        raw_calls = obj.get("calls") or [obj]
+    elif isinstance(obj, list):
+        raw_calls = obj
+    else:
+        return []
+
+    out = []
+    for idx, c in enumerate(raw_calls, 1):
+        if not isinstance(c, dict):
+            continue
+        name = c.get("name")
+        if name not in valid_names:
+            continue
+        args = c.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                return []
+        if not isinstance(args, dict):
+            continue
+        out.append({
+            "id": c.get("id") or ("call_%d" % idx),
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+        })
+    return out
+
+
+def _text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        buf = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            t = item.get("type")
+            if t == "text":
+                buf.append(item.get("text", ""))
+            elif t in ("input_text", "output_text"):
+                buf.append(item.get("text", ""))
+        return "\n".join(buf)
+    return "" if content is None else str(content)
+
+
+def _image_parts_from(content):
+    """把 OpenAI content 里的图片抽成 opencode 的 file part。"""
+    out = []
+    if not isinstance(content, list):
+        return out
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "image_url":
+            continue
+        url = (item.get("image_url") or {}).get("url", "")
+        if not url:
+            continue
+        if url.startswith("data:"):
+            mime = url.split(";", 1)[0][5:]
+            out.append({"type": "file", "mime": mime or "image/png", "url": url})
+        else:
+            mime, _ = mimetypes.guess_type(url.split("?")[0])
+            out.append({"type": "file", "mime": mime or "image/jpeg", "url": url})
+    return out
+
+
+def build_payload(body):
+    """OpenAI body -> (parts, system_text, model_id, stream)"""
+    messages = body.get("messages") or []
+    model_id = body.get("model") or DEFAULT_MODEL
+    model_id = model_id.split("/", 1)[1] if "/" in model_id else model_id
+
+    system_chunks, turns, images = [], [], []
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content")
+        txt = _text_of(content)
+        if role == "system":
+            if txt:
+                system_chunks.append(txt)
+            continue
+        if txt:
+            if role == "tool":
+                turns.append("tool result%s: %s" % (
+                    " for " + m.get("tool_call_id", "") if m.get("tool_call_id") else "", txt))
+            elif role == "assistant" and m.get("tool_calls"):
+                names = [tc.get("function", {}).get("name", "?") for tc in m["tool_calls"]]
+                turns.append("assistant: called %s -> %s" % (", ".join(names), txt or "(no content)"))
+            else:
+                turns.append("%s: %s" % (role, txt))
+        images.extend(_image_parts_from(content))
+
+    parts = list(images)
+    tools = body.get("tools") or []
+    prompt = "\n\n".join(turns).strip()
+    if prompt:
+        parts.append({"type": "text", "text": prompt})
+
+    if not parts:
+        parts.append({"type": "text", "text": "hello"})
+
+    stream = bool(body.get("stream"))
+    return parts, "\n\n".join(system_chunks).strip(), model_id, stream, tools
+
+
+# ---------------- HTTP 服务 ----------------
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "zen-bridge/1.0"
+    sdk = None            # type: OpencodeSDK
+    default_model = DEFAULT_MODEL
+
+    def _send(self, code, obj, stream=False):
+        if stream:
+            # 不写 Content-Length / keep-alive：handler 返回后连接自动关闭（HTTP/1.0），
+            # 客户端以 EOF 作为流结束信号。少了这一步，客户端会一直空等到超时。
+            self.send_response(code)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            return
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _sse(self, obj):
+        chunk = "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+        self.wfile.write(chunk.encode("utf-8"))
+        self.wfile.flush()
+
+    def _read_body(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            return {}
+
+    # ---- 路由 ----
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path in ("/", "/healthz", "/health"):
+            self._send(200, {
+                "ok": self.sdk.alive(),
+                "bridge_model": self.default_model,
+                "upstream": "http://127.0.0.1:%d" % self.sdk.port,
+            })
+        elif path == "/v1/models":
+            data = [{
+                "id": m, "object": "model", "created": 0,
+                "owned_by": PROVIDER,
+            } for m in [self.default_model] + [x for x in KNOWN_FREE if x != self.default_model]]
+            self._send(200, {"object": "list", "data": data})
+        else:
+            self._send(404, {"error": {"message": "not found: " + path}})
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+        self.end_headers()
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path not in ("/v1/chat/completions", "/chat/completions"):
+            self._send(404, {"error": {"message": "not found: " + path}})
+            return
+
+        body = self._read_body()
+        try:
+            parts, system_text, model_id, stream, tools = build_payload(body)
+        except Exception as e:
+            self._send(400, {"error": {"message": "bad request: %s" % e}})
+            return
+
+        # 工具模拟：把 tools 清单塞进 system 提示，让模型按要求吐 JSON
+        # 注意：指令必须放进**用户消息正文**而不是 system 字段 ——
+        # 实测 system 会被 opencode agent 自己的提示压掉，模型会转头去用它内置的工具。
+        valid_names = []
+        if tools:
+            digest = build_tools_digest(tools)
+            valid_names = [n for n in
+                           [t.get("function", t).get("name") for t in tools] if n]
+            prefix = TOOL_INSTRUCTION.format(tools=digest)
+            parts = _with_tool_prefix(parts, prefix)
+
+        t0 = time.time()
+        try:
+            if not self.sdk.ensure():
+                self._send(503, {"error": {
+                    "message": "opencode serve unavailable on port %d" % self.sdk.port}})
+                return
+            answer, usage = self.sdk.complete(model_id, parts, system_text)
+            # 看着像要调工具却没解析出来 -> 只重试一次，避免延迟翻倍
+            if valid_names and not parse_tool_calls(answer, valid_names) and (
+                    '}' in answer and '"' in answer or "calls" in answer):
+                retry_parts = list(parts) + [{
+                    "type": "text",
+                    "text": "Your previous reply was not valid JSON. "
+                            "Output ONLY one JSON line in the required format, with no explanation."}]
+                answer2, usage2 = self.sdk.complete(model_id, retry_parts, system_text)
+                if parse_tool_calls(answer2, valid_names):
+                    answer = answer2
+                    usage = {"prompt_tokens": usage["prompt_tokens"] + usage2["prompt_tokens"],
+                             "completion_tokens": usage["completion_tokens"] + usage2["completion_tokens"],
+                             "total_tokens": usage["total_tokens"] + usage2["total_tokens"]}
+        except Exception as e:
+            log("ERROR %s" % e)
+            err = {"error": {"message": str(e), "type": "upstream_error"}}
+            if stream:
+                self._send(200, None, stream=True)
+                self._sse(err)
+                self.wfile.write(b"data: [DONE]\n\n")
+            else:
+                self._send(502, err)
+            return
+
+        tool_calls = parse_tool_calls(answer, valid_names) if valid_names else []
+        log("%s  %.1fs  in=%s out=%s%s" % (
+            model_id, time.time() - t0, usage["prompt_tokens"], usage["completion_tokens"],
+            "  [tool_calls=%d]" % len(tool_calls) if tool_calls else ""))
+        cid = "chatcmpl-" + uuid.uuid4().hex[:24]
+        ts = int(time.time())
+
+        if stream:
+            self._send(200, None, stream=True)
+            self._sse({"id": cid, "object": "chat.completion.chunk", "created": ts,
+                       "model": model_id,
+                       "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
+            if tool_calls:
+                for tc in tool_calls:
+                    self._sse({"id": cid, "object": "chat.completion.chunk", "created": ts,
+                               "model": model_id,
+                               "choices": [{"index": 0, "delta": {"tool_calls": [tc]},
+                                            "finish_reason": None}]})
+                self._sse({"id": cid, "object": "chat.completion.chunk", "created": ts,
+                           "model": model_id,
+                           "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                           "usage": usage})
+            else:
+                self._sse({"id": cid, "object": "chat.completion.chunk", "created": ts,
+                           "model": model_id,
+                           "choices": [{"index": 0, "delta": {"content": answer}, "finish_reason": None}]})
+                self._sse({"id": cid, "object": "chat.completion.chunk", "created": ts,
+                           "model": model_id,
+                           "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                           "usage": usage})
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        else:
+            message = {"role": "assistant", "content": None if tool_calls else answer}
+            if tool_calls:
+                message["tool_calls"] = tool_calls
+            self._send(200, {
+                "id": cid, "object": "chat.completion", "created": ts, "model": model_id,
+                "choices": [{"index": 0, "message": message,
+                             "finish_reason": "tool_calls" if tool_calls else "stop"}],
+                "usage": usage,
+            })
+
+    def log_message(self, fmt, *args):
+        pass  # 安静模式：不用默认访问日志刷屏
+
+
+def main():
+    ap = argparse.ArgumentParser(description="OpenAI -> opencode SDK 桥接（零依赖单文件）")
+    ap.add_argument("--port", type=int, default=8787, help="本桥接监听端口（默认 8787）")
+    ap.add_argument("--sdk-port", type=int, default=41234, help="opencode serve 的端口（默认 41234）")
+    ap.add_argument("--model", default=DEFAULT_MODEL, help="默认模型 ID")
+    ap.add_argument("--agent", default="general",
+                    help="opencode agent 名；general 实测最快（默认 general）"
+                         "，可选 build/plan/explore/summary 等")
+    ap.add_argument("--opencode-bin", default=None, help="opencode 可执行文件路径")
+    ap.add_argument("--auto-start", action="store_true", help="SDK 未运行时自动拉起 opencode serve")
+    ap.add_argument("--keep-session", action="store_true",
+                    help="复用同一个 opencode session（更快，但上下文会累积）")
+    args = ap.parse_args()
+
+    sdk = OpencodeSDK(args.sdk_port, args.auto_start, args.opencode_bin, args.agent,
+                      args.keep_session)
+    Handler.sdk = sdk
+    Handler.default_model = args.model
+
+    srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    log("zen_bridge 监听 http://127.0.0.1:%d/v1/chat/completions" % args.port)
+    log("默认模型: %s | Ctrl+C 退出" % args.model)
+
+    # --auto-start 时先把 SDK 拉起来预热，否则第一个请求要额外等 20s 才有响应
+    if args.auto_start:
+        log("预热 opencode serve ...")
+        sdk.ensure()
+        log("上游 opencode SDK: http://127.0.0.1:%d  (%s)" % (
+            args.sdk_port, "在线" if sdk.alive() else "未运行"))
+    else:
+        log("上游 opencode SDK: http://127.0.0.1:%d  (%s)" % (
+            args.sdk_port, "在线" if sdk.alive() else "未运行"))
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        log("退出")
+        srv.server_close()
+
+
+if __name__ == "__main__":
+    main()
