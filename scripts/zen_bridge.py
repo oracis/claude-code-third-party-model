@@ -47,16 +47,25 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PROVIDER = "opencode"
 DEFAULT_MODEL = "deepseek-v4.1-flash-free"
-# opencode 里常见的免费模型，只用于 /v1/models 展示，实际转发不限制
-# （space-bunny-free 于 2026-10-16 被 Zen 下线，已从列表移除）
+# opencode 里可用的免费模型，只用于 /v1/models 展示，实际转发不限制。
+# 2026-10-16 按 Zen 免鉴权目录 https://opencode.ai/zen/v1/models + 桥接实测重校：
+#   - ling-3.1-flash-free / step-5-preview-free / exo-free 已不在免费目录，移除。
+#   - 补 big-pickle / jev-1.13-free / nemotron-3.5-super-vl-free。
+#   - 下面带 [地区封锁] 的虽在目录里，但当前网络地区取不到（返回空内容），
+#     保留仅供将来换网络/换出口后可用，不建议现在用。
+#   - jev-1.13-free 实测 HTTP 500，本地不可用。
 KNOWN_FREE = [
     "deepseek-v4.1-flash-free",
-    "ling-3.1-flash-free",
+    "space-bunny-free",
+    "big-pickle",
+    "nemotron-3.5-super-vl-free",
     "mimo-v2.6-flash-free",
-    "nemotron-3.5-lightning-free",
-    "step-5-preview-free",
     "longcat-2.5-preview-free",
-    "exo-free",
+    "nemotron-3.5-lightning-free",
+    "jev-1.13-free",
+    "cat-jam-free",                      # [地区封锁] 当前返回空内容
+    "muse-spark-1.3-contributor-free",   # [地区封锁] 当前返回空内容
+    "muse-spark-1.2-contributor-free",   # [地区封锁] 实测 HTTP 500
 ]
 
 _lock = threading.Lock()
@@ -160,8 +169,10 @@ class OpencodeSDK:
             return False
 
     # ---------- 一次对话 ----------
-    def complete(self, model_id, openai_parts, system_text, agent=None):
-        """返回 (assistant_text, usage_dict)。"""
+    def complete(self, model_id, openai_parts, system_text, agent=None,
+                 provider=None):
+        """返回 (assistant_text, usage_dict)。provider 缺省用全局 PROVIDER。"""
+        provider = provider or PROVIDER
         with _lock:
             sid = None
             if self.keep_session and self._session_id:
@@ -172,7 +183,7 @@ class OpencodeSDK:
             if sid is None:
                 st, raw = self._req("POST", "/session", {
                     "title": "zen-bridge " + time.strftime("%m-%d %H:%M:%S"),
-                    "model": {"id": model_id, "providerID": PROVIDER},
+                    "model": {"id": model_id, "providerID": provider},
                 }, timeout=30)
                 if st != 200:
                     raise RuntimeError("create session failed: %s %s" % (st, raw[:300]))
@@ -182,7 +193,7 @@ class OpencodeSDK:
 
         body = {
             "parts": openai_parts,
-            "model": {"providerID": PROVIDER, "modelID": model_id},
+            "model": {"providerID": provider, "modelID": model_id},
         }
         if system_text:
             body["system"] = system_text
@@ -394,11 +405,26 @@ def _image_parts_from(content):
     return out
 
 
-def build_payload(body):
-    """OpenAI body -> (parts, system_text, model_id, stream)"""
+def split_model(raw, default_provider=None):
+    """'provider/model' -> (model, provider)；无前缀时 provider 为 None。
+
+    只按**第一个**斜杠切分，因此 'deepinfra/anthropic/claude-fable-5' 能正确拆成
+    provider='deepinfra' + model='anthropic/claude-fable-5'（模型 id 自身含斜杠）。
+    'opencode/xxx' 这类显式前缀也照此处理；纯模型名则交给调用方的默认值。
+    """
+    raw = (raw or "").strip()
+    if "/" in raw:
+        prov, _, model = raw.partition("/")
+        if prov and model:
+            return model, prov
+    return raw, default_provider
+
+
+def build_payload(body, default_provider=None):
+    """OpenAI body -> (parts, system_text, model_id, stream, tools, provider)"""
     messages = body.get("messages") or []
-    model_id = body.get("model") or DEFAULT_MODEL
-    model_id = model_id.split("/", 1)[1] if "/" in model_id else model_id
+    raw_model = body.get("model") or DEFAULT_MODEL
+    model_id, provider = split_model(raw_model, default_provider)
 
     system_chunks, turns, images = [], [], []
     for m in messages:
@@ -430,15 +456,16 @@ def build_payload(body):
         parts.append({"type": "text", "text": "hello"})
 
     stream = bool(body.get("stream"))
-    return parts, "\n\n".join(system_chunks).strip(), model_id, stream, tools
+    return parts, "\n\n".join(system_chunks).strip(), model_id, stream, tools, provider
 
 
 # ---------------- HTTP 服务 ----------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "zen-bridge/1.0"
+    server_version = "zen-bridge/1.1"
     sdk = None            # type: OpencodeSDK
     default_model = DEFAULT_MODEL
+    default_provider = PROVIDER
 
     def _send(self, code, obj, stream=False):
         if stream:
@@ -478,12 +505,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {
                 "ok": self.sdk.alive(),
                 "bridge_model": self.default_model,
+                "bridge_provider": self.default_provider,
                 "upstream": "http://127.0.0.1:%d" % self.sdk.port,
             })
         elif path == "/v1/models":
             data = [{
                 "id": m, "object": "model", "created": 0,
-                "owned_by": PROVIDER,
+                "owned_by": self.default_provider,
             } for m in [self.default_model] + [x for x in KNOWN_FREE if x != self.default_model]]
             self._send(200, {"object": "list", "data": data})
         else:
@@ -504,7 +532,8 @@ class Handler(BaseHTTPRequestHandler):
 
         body = self._read_body()
         try:
-            parts, system_text, model_id, stream, tools = build_payload(body)
+            parts, system_text, model_id, stream, tools, provider = build_payload(
+                body, self.default_provider)
         except Exception as e:
             self._send(400, {"error": {"message": "bad request: %s" % e}})
             return
@@ -526,7 +555,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(503, {"error": {
                     "message": "opencode serve unavailable on port %d" % self.sdk.port}})
                 return
-            answer, usage = self.sdk.complete(model_id, parts, system_text)
+            answer, usage = self.sdk.complete(model_id, parts, system_text,
+                                             provider=provider)
             # 看着像要调工具却没解析出来 -> 只重试一次，避免延迟翻倍
             if valid_names and not parse_tool_calls(answer, valid_names) and (
                     '}' in answer and '"' in answer or "calls" in answer):
@@ -534,7 +564,8 @@ class Handler(BaseHTTPRequestHandler):
                     "type": "text",
                     "text": "Your previous reply was not valid JSON. "
                             "Output ONLY one JSON line in the required format, with no explanation."}]
-                answer2, usage2 = self.sdk.complete(model_id, retry_parts, system_text)
+                answer2, usage2 = self.sdk.complete(model_id, retry_parts, system_text,
+                                                    provider=provider)
                 if parse_tool_calls(answer2, valid_names):
                     answer = answer2
                     usage = {"prompt_tokens": usage["prompt_tokens"] + usage2["prompt_tokens"],
@@ -603,6 +634,10 @@ def main():
     ap.add_argument("--port", type=int, default=8787, help="本桥接监听端口（默认 8787）")
     ap.add_argument("--sdk-port", type=int, default=41234, help="opencode serve 的端口（默认 41234）")
     ap.add_argument("--model", default=DEFAULT_MODEL, help="默认模型 ID")
+    ap.add_argument("--provider", default=PROVIDER,
+                    help="默认 provider（默认 %s）。opencode 下共 230 个 provider，"
+                         "换这个值即可把桥接指向别的 provider；"
+                         "也可在请求 model 字段里写 'provider/模型名' 单次覆盖" % PROVIDER)
     ap.add_argument("--agent", default="general",
                     help="opencode agent 名；general 实测最快（默认 general）"
                          "，可选 build/plan/explore/summary 等")
@@ -616,10 +651,11 @@ def main():
                       args.keep_session)
     Handler.sdk = sdk
     Handler.default_model = args.model
+    Handler.default_provider = args.provider
 
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     log("zen_bridge 监听 http://127.0.0.1:%d/v1/chat/completions" % args.port)
-    log("默认模型: %s | Ctrl+C 退出" % args.model)
+    log("默认模型: %s (provider=%s) | Ctrl+C 退出" % (args.model, args.provider))
 
     # --auto-start 时先把 SDK 拉起来预热，否则第一个请求要额外等 20s 才有响应
     if args.auto_start:

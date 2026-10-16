@@ -2,7 +2,7 @@
 name: claude-code-third-party-model
 slug: claude-code-third-party-model
 displayName: Claude Code 接入第三方模型
-version: 1.4.0
+version: 1.5.0
 license: MIT
 category: dev-programming
 subCategories: [dev-script, dev-bug-fix]
@@ -1295,6 +1295,7 @@ python scripts/ccswitch.py delete <profile> --permanent     # 连付费模型也
 |---|---|
 | `scripts/ccproxy.py` | 网关本体（Python 3 **stdlib**，零第三方依赖，约 740 行） |
 | `scripts/ccswitch.py` | profile 切换器 + 网关启停协调（跨平台，约 515 行） |
+| `scripts/zen_bridge.py` | OpenAI `<->` opencode SDK 桥接（零依赖，约 668 行）；`--provider` 切默认 provider，请求里写 `provider/模型名` 可单次覆盖 |
 | `~/.claude-code-proxy.json` | 配置：`host` / `port` / `upstream{url,model,api_key}` / `timeout` / `verbose` / `client_token` |
 | `examples/claude_model_switcher.pyw` | 桌面 GUI 切换器（双击即用，含删除/刷新模型；`~/.local/bin` 同名文件应从此处同步） |
 | `examples/profiles/*.json` | 开箱可用的 `settings.json` 模板，拷到 `~/.claude/profiles/` |
@@ -1493,6 +1494,33 @@ WorkBuddy  ───────────────── OpenAI ───�
 
 `scripts/zen_bridge.py`（零依赖单文件）负责 OpenAI `<->` opencode SDK 的转换，
 `opencode serve` 由桥接用 `--auto-start` 自动拉起。
+
+### 换 provider / 换模型（桥接已支持）
+
+桥接**不限制模型名**：`KNOWN_FREE` 只是 `/v1/models` 的展示清单，`build_payload()`
+直取请求里的 `model` 字段转发。约束只在 provider 上，且现在可配：
+
+```bash
+# 1) 启动时指定默认 provider（默认 opencode）
+python zen_bridge.py --provider siliconflow --model Qwen/Qwen3-8B
+
+# 2) 或在请求里单次覆盖：model 写成 "provider/模型名"，按第一个斜杠切分
+curl http://127.0.0.1:8787/v1/chat/completions -d '{
+  "model": "deepinfra/anthropic/claude-fable-5",
+  "messages": [{"role":"user","content":"hi"}]}'
+```
+
+按**第一个**斜杠切分，所以模型 id 自身含斜杠也能正确解析
+（`deepinfra/anthropic/claude-fable-5` → provider=`deepinfra` + model=`anthropic/claude-fable-5`）。
+
+⚠️ **opencode 有 230 个 provider，但绝大多数没配 API key**：opencode 只是列出了模型目录，
+调用时没有凭据会在发消息阶段返回 **500**（注意：建会话仍返回 200，**不能拿建会话成功当可用性判据**）。
+`opencode` 这个 provider 是特例——Zen 免费层走客户端鉴权，所以不配 key 也能用。
+
+**实测能出字的**（2026-10-16，opencode provider 下）：`deepseek-v4.1-flash-free`(2.0s)、
+`big-pickle`(2.0s)、`space-bunny-free`(1.7s)。
+**空壳/不可用**：`muse-spark-1.3-contributor-free`、`cat-jam-free`（`parts=[]` 无输出）；
+`nemotron-3-ultra-free`（180s 超时）。
 
 ## profile 的自描述字段（`x_*`）
 
