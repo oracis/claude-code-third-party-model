@@ -40,6 +40,21 @@ MODELS = [
     ("DeepSeek V4.1 Flash（免费·Zen）", "zen-ds-flash", 3462,
      "--upstream http://127.0.0.1:8787/v1/chat/completions "
      "--model deepseek-v4.1-flash-free --key anonymous", True),
+    ("👑 Space Bunny Free（免费·Zen·1M·实测最快）", "zen-space-bunny", 3463,
+     "--upstream http://127.0.0.1:8787/v1/chat/completions "
+     "--model space-bunny-free --key anonymous", True),
+    ("Nemotron 3.5 Super-VL（免费·Zen·1M）", "zen-nemotron-vl", 3464,
+     "--upstream http://127.0.0.1:8787/v1/chat/completions "
+     "--model nemotron-3.5-super-vl-free --key anonymous", True),
+    ("LongCat 2.5 Preview（免费·Zen·1M）", "zen-longcat", 3465,
+     "--upstream http://127.0.0.1:8787/v1/chat/completions "
+     "--model longcat-2.5-preview-free --key anonymous", True),
+    ("MiMo V2.6 Flash（免费·Zen·200k）", "zen-mimo", 3467,
+     "--upstream http://127.0.0.1:8787/v1/chat/completions "
+     "--model mimo-v2.6-flash-free --key anonymous", True),
+    ("Big Pickle（免费·Zen·200k）", "zen-big-pickle", 3468,
+     "--upstream http://127.0.0.1:8787/v1/chat/completions "
+     "--model big-pickle --key anonymous", True),
     ("Kilo 文本 + 读图桥接（免费）", "kilo-bridge", 3457,
      "--upstream https://api.kilo.ai/api/gateway/v1/chat/completions --model kilo-auto/free --key anonymous", False),
     ("读图 Vision（免费·可看图）", "vision", 3458,
@@ -53,10 +68,20 @@ MODELS = [
 
 DETACHED = 0x00000008  # DETACHED_PROCESS
 
+# 打开本工具时自动连上的模型（= MODELS 里带 👑 的实测最优项）。
+# 桥接不再开机自启，改为「点切换器时才起」——这个 profile 就是那条起链路的入口。
+# 想改默认，改这里的 profile 名即可（须与 MODELS 里的 profile 对应）。
+PREFERRED_PROFILE = "zen-space-bunny"
+
 # 删除下拉框用的短标签（按钮显示名太长，Combobox 里放不下会被截断）：
 # 精简到「模型名 + 免费/付费」，一眼可辨又短。没列到的用 fallback 逻辑补。
 DEL_LABELS = {
     "zen-ds-flash": "DS V4.1 Flash 免费·Zen",
+    "zen-space-bunny": "👑 Space Bunny 免费·最快",
+    "zen-nemotron-vl": "Nemotron VL 免费·1M",
+    "zen-longcat": "LongCat 免费·1M",
+    "zen-mimo": "MiMo V2.6 免费",
+    "zen-big-pickle": "Big Pickle 免费",
     "deepseek":     "DeepSeek-V4 付费",
     "glm4":         "GLM-4-Flash 免费",
     "glm4-bridge":  "GLM-4-Flash 免费+读图",
@@ -259,6 +284,18 @@ class App(tk.Tk):
         self._task = None
         self._del_map = {}  # 下拉显示文本 -> profile 名
         self.refresh()
+        # 打开即自动连上皇冠模型（静默，不弹框）；失败也不打扰，照常等用户手点
+        self.after(400, self._auto_connect)
+
+    def _auto_connect(self):
+        """启动时静默切到 PREFERRED_PROFILE，把桥接和网关一并拉起。"""
+        for disp, prof, port, args, bridge in MODELS:
+            if prof != PREFERRED_PROFILE:
+                continue
+            if not os.path.isfile(os.path.join(PROFILES_DIR, prof + ".json")):
+                return
+            self.on_click(disp, prof, port, args, bridge, quiet=True)
+            return
 
     def refresh_del_list(self):
         """下拉列表显示「短标签 [profile名]」，分得清免费/付费，不会误删。"""
@@ -367,8 +404,10 @@ class App(tk.Tk):
             self.status.config(text=text, fg=color or "blue")
         self.update_idletasks()
 
-    def on_click(self, disp, prof, port, args, bridge):
+    def on_click(self, disp, prof, port, args, bridge, quiet=False):
         if not os.path.isfile(os.path.join(PROFILES_DIR, prof + ".json")):
+            if quiet:
+                return
             messagebox.showwarning(
                 "该模型已删除",
                 "「%s」的 profile 已被删除。\n点下方「刷新列表」或重启本工具。"
@@ -376,7 +415,8 @@ class App(tk.Tk):
             self.refresh_del_list()
             return
         self._task = {"disp": disp, "prof": prof, "port": port, "args": args,
-                      "bridge": bridge, "done": False, "result": None}
+                      "bridge": bridge, "quiet": quiet, "done": False,
+                      "result": None}
         tip = ("正在拉起 Zen 桥接（约 30 秒，含 opencode serve 冷启动）..."
                if bridge else "正在切换...")
         self._set_busy(True, tip, "#b8860b")
@@ -401,10 +441,25 @@ class App(tk.Tk):
             return
         msg, ok = t["result"]
         self._set_busy(False)
+        if t.get("quiet"):
+            # 自动连接：只在状态栏显示，不弹框（每次开工具都弹一次很烦）
+            self._set_busy(False, ("已自动连上 %s（%s）" % (t["disp"], msg)) if ok
+                            else ("自动连接失败：%s" % msg),
+                            "green" if ok else "darkred")
+            self._task = None
+            self.refresh()
+            return
+        # 取该 profile 真实的模型 ID（原来硬编码 deepseek-v4.1-flash-free，换模型就错了）
+        try:
+            pf = json.load(open(os.path.join(PROFILES_DIR, t["prof"] + ".json"),
+                                encoding="utf-8"))
+            mid = pf.get("model") or (pf.get("env") or {}).get("ANTHROPIC_MODEL", "")
+        except Exception:
+            mid = ""
         extra = ""
-        if t["bridge"] and ok:
+        if t["bridge"] and ok and mid:
             extra = ("\n\n桥接已就绪，WorkBuddy 侧也能用同一个模型：\n"
-                     "模型列表选 custom-local:deepseek-v4.1-flash-free")
+                     "模型列表选 vendor=opencode 的 %s" % mid)
         messagebox.showinfo(
             "已切换" if ok else "部分失败",
             "已切换到：%s\n%s%s\n\n重启 Claude Code 后生效。\n"

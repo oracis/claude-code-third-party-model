@@ -923,12 +923,66 @@ if defined OLD taskkill /F /PID !OLD!
 **适用**：模型只在 OpenAI 兼容网关上提供，没有 Anthropic 原生端点。
 典型是 OpenCode Zen 的免费层（2026-09 时是 Space Bunny，1M 上下文、强制推理、五档 effort、$0）。
 
-> 🗑️ **2026-10-16 更新：Space Bunny / `space-bunny-free` 已下线，别再用。**
-> Zen 免费层换成了 `deepseek-v4.1-flash-free`（同样免 key，但**不能直连**——
-> 直连会报 `FreeTierError: only used from within OpenCode`，必须走 opencode SDK）。
-> 现役链路与配置见 **第八部分：Zen 免费模型的两段式链路**。profile 已改为
-> `zen-ds-flash`，旧的 `spacebunny` profile 与 `examples/profiles/spacebunny.json`
-> 均已移除（备份在 `~/.workbuddy/backups/spacebunny-cleanup-*`）。
+> ✅ **2026-10-16 更正：`space-bunny-free` 并未下线，实测可用且很快。**
+> 早前记为「已下线」是错的。13:28 经 `zen_bridge`(:8787) 与 ccproxy(:3463) 两段实测：
+> 对话正常、工具调用命中 `get_weather`、端到端 13.5s。现役 profile 为 `zen-ds-flash`
+> （`deepseek-v4.1-flash-free`）。
+>
+> Zen 免费层**不能直连**：直连报 `FreeTierError: only used from within OpenCode`
+> （改 UA 伪装无效），必须走 `opencode serve` + 本地桥接，见**第八部分**。
+>
+> **免费模型已全部接进切换器**（`~/.claude/profiles/` + `claude_model_switcher.pyw` 的
+> `MODELS`/`DEL_LABELS` 已登记；6 个也已进 `~/.workbuddy/models.json`）：
+>
+> | profile | 模型 | ccproxy 端口 | 真实上下文 | 端到端 |
+> |---|---|---|---|---|
+> | `zen-longcat` | `longcat-2.5-preview-free` | 3465 | 1M | 4.2s |
+> | `zen-mimo` | `mimo-v2.6-flash-free` | 3467 | 200k | 4.9s |
+> | `zen-nemotron-vl` | `nemotron-3.5-super-vl-free` | 3464 | 1M | 6.9s |
+> | `zen-big-pickle` | `big-pickle` | 3468 | 200k | 12.1s |
+> | `zen-space-bunny` 👑 | `space-bunny-free` | 3463 | 1M | **1.3s** |
+> | `zen-ds-flash` | `deepseek-v4.1-flash-free` | 3462 | 200k | 4.0s |
+>
+> 不可用：`jev-1.13-free`(500)、`cat-jam-free` 与 `muse-spark-1.3-contributor-free`
+> （**200 但空 content**= 地区封锁）、`muse-spark-1.2-contributor-free`(500)。
+> `nemotron-3.5-lightning-free` 能跑但**用户决定不接入**（端到端偏慢，历史最慢测到 18.6s，
+> 已从 profile / GUI / models.json / KNOWN_FREE 全部移除；端口 3466 因此空出）。
+>
+> 踩坑要点：
+> - **每个模型必须独占一个 ccproxy 端口**（不同 upstream 不能共端口）。新增模型时
+>   `x_gateway_port` 与 `x_ccproxy_args --model` 要成对改。
+> - `[1m]` 后缀只给**真实 1M 上下文**的模型（表中 1M 那几个）。别照抄——
+>   `zen-ds-flash` 标的 `[1m]` 其实只有 200k，靠 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` 兜底。
+> - GUI 模型清单是**硬编码**的，只加 profile 文件 GUI 里**不显示**；`ccswitch.py` 是动态扫目录。
+> - **桥接不开机自启**（2026-10-16 移除 Startup 里的 `zen-bridge-autostart.cmd`，
+>   原文件备份在 `~/.claude/backups/zen-bridge-autostart.cmd.removed-*`）：
+>   改为**点切换器时才起**。GUI 打开后 400ms 自动连 `PREFERRED_PROFILE`
+>   （当前 = `zen-space-bunny` 👑，静默执行不弹框），这条链路顺带把 zen_bridge
+>   和对应 ccproxy 网关都拉起来。冷启动约 30s（含 `opencode serve`）。
+>   改默认模型只需改 GUI 顶部的 `PREFERRED_PROFILE` 常量。
+> - 判「可用」**不能只看 HTTP 200**：地区封锁返回 200 + 空 content。
+> - 🔴 **绝对不要把 Zen 模型配成 WorkBuddy 自定义模型**（2026-10-16 实测踩坑）：
+>   WorkBuddy 发的是**完整 agent 提示词 + 25 个工具定义（约 34K 字符）**，
+>   桥接转给 `opencode serve` 后，**opencode 的 general agent 会把提示当任务自己执行**——
+>   用**它自己内置的工具**去读写用户真实项目文件（实测抓到它跑
+>   `Get-ChildItem D:\ai-case-library\tmp`、`read tmp\*.log`），形成 agent 循环，
+>   WorkBuddy 侧永远停在「准备中」。已从 `~/.workbuddy/models.json` 移除全部 Zen 条目。
+>   - 本文件桥接源码注释其实已预警：「system 会被 opencode agent 自己的提示压掉，
+>     模型会转头去用它内置的工具」——WorkBuddy 的提示词体量让这从「可能」变「必然」。
+>   - `POST /session/:id/abort` **对正在跑的 subagent 循环无效**（返回 200 但仍在更新），
+>     唯一可靠手段是**杀掉 `opencode serve` 进程**。
+>   - 小提示请求不会触发接管，所以端到端测试全绿也掩盖了它——**只有真实 agent 提示词才暴露**。
+>   - Claude Code 侧不受影响：请求经 ccproxy，工具集小，实测 1.3~3.5s 正常返回。
+> - 本机代理 `127.0.0.1:9749` 出口与直连相同（江苏联通），测 VPN 需开 TUN/全局模式。
+> - **上表耗时是单次采样，噪声大，别据此下结论。**以 2 轮基准为准
+>   （真实提示 + 并行工具调用「查北京和上海」）：
+>   `space-bunny-free` **1.3s(1.1/1.4) 👑 最快最稳** > `nemotron-3.5-super-vl-free` 1.7s
+>   > `deepseek-v4.1-flash-free` 1.9s > `big-pickle` 3.2s > `longcat-2.5-preview-free` 5.6s
+>   > `mimo-v2.6-flash-free` 8.2s(3.7/12.8，很不稳)。6 个都能正确一次返回**多个** `tool_use`。
+>   👑 = 实测最优，GUI 已标皇冠，**日常首选**。
+>   ⚠️ 反面教材：单次采样曾把 `space-bunny-free` 测成 13.5s（最慢）、`longcat` 测成 4.2s（第二），
+>   复测后完全颠倒。**性能结论必须多轮。**
+>
 > 本部分剩余内容保留作 **OpenAI→Anthropic 网关类问题** 的历史排查参考。
 
 > ⚠️ **2026-09-29 重大更正：`claude-code-router` 的流式转换是坏的，不要再拿它做方案。**
@@ -950,7 +1004,7 @@ if defined OLD taskkill /F /PID !OLD!
 | 上游 | 端点 | 模型名 | 认证 | 状态 |
 |---|---|---|---|---|
 | **OpenCode Zen** | `https://opencode.ai/zen/v1/chat/completions` | `deepseek-v4.1-flash-free` | **免 key（匿名）** | ✅ 现役，但**必须走 opencode SDK**（见第八部分） |
-| OpenCode Zen | 同上 | `space-bunny-free` | 免 key | ❌ **2026-10-16 已下线** |
+| OpenCode Zen | 同上 | `space-bunny-free` | 免 key | ✅ **实测仍可用**（2026-10-16，profile `zen-space-bunny`，端口 3463）；早前「已下线」的记录有误 |
 | OpenRouter | `https://openrouter.ai/api/v1/chat/completions` | `stealth/space-bunny-alpha` | 需 key（注意：整段 `:free` 后缀会 404） | ❌ 随模型下线 |
 | AI/ML API | `https://api.aimlapi.com/v1/chat/completions` | `stealth/space-bunny-alpha` | 需 key | ❌ 随模型下线 |
 

@@ -61,7 +61,6 @@ KNOWN_FREE = [
     "nemotron-3.5-super-vl-free",
     "mimo-v2.6-flash-free",
     "longcat-2.5-preview-free",
-    "nemotron-3.5-lightning-free",
     "jev-1.13-free",
     "cat-jam-free",                      # [地区封锁] 当前返回空内容
     "muse-spark-1.3-contributor-free",   # [地区封锁] 当前返回空内容
